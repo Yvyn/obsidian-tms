@@ -1,0 +1,921 @@
+import {
+  App,
+  Editor,
+  EditorPosition,
+  EditorSuggest,
+  EditorSuggestContext,
+  EditorSuggestTriggerInfo,
+  Plugin,
+  Modal,
+  Notice,
+  TFile,
+  TFolder,
+  Setting,
+  SuggestModal,
+  PluginSettingTab,
+} from "obsidian";
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+interface TestCase {
+  line: string;
+  name: string;
+  tags: string[];
+  lineNumber: number;
+  indent: number;
+  children: TestCase[];
+  hasChildren: boolean;
+  isHeading?: boolean;
+  headingLevel?: number;
+}
+
+type TagState = "neutral" | "include" | "exclude";
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function parseTestCase(line: string, lineNumber: number): TestCase | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+
+  const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)/);
+  if (headingMatch) {
+    const headingLevel = headingMatch[1].length;
+    const rawName = headingMatch[2].trim();
+    const tagRegex = /@([\p{L}\p{N}_-]+)/gu;
+    const tags: string[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = tagRegex.exec(rawName)) !== null) tags.push(m[1].toLowerCase());
+    const firstTagIndex = rawName.search(/@[\p{L}\p{N}_-]+/u);
+    const name = firstTagIndex >= 0 ? rawName.slice(0, firstTagIndex).trim() : rawName;
+    return { line: trimmed, name, tags, lineNumber, indent: 0, children: [], hasChildren: false, isHeading: true, headingLevel };
+  }
+
+  const leadingWhitespace = line.match(/^(\s*)/)?.[1] || "";
+  const tabCount = (leadingWhitespace.match(/\t/g) || []).length;
+  const spaceCount = (leadingWhitespace.match(/ /g) || []).length;
+  const indent = tabCount + Math.floor(spaceCount / 2);
+
+  const tagRegex = /@([\p{L}\p{N}_-]+)/gu;
+  const tags: string[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = tagRegex.exec(trimmed)) !== null) {
+    tags.push(match[1].toLowerCase());
+  }
+
+  const firstTagIndex = trimmed.search(/@[\p{L}\p{N}_-]+/u);
+  const name = firstTagIndex >= 0 ? trimmed.slice(0, firstTagIndex).trim() : trimmed;
+
+  return { line: trimmed, name, tags, lineNumber, indent, children: [], hasChildren: false };
+}
+
+function parseTestCases(content: string): TestCase[] {
+  const lines = content.split("\n");
+  const allItems: TestCase[] = [];
+
+  lines.forEach((line, idx) => {
+    const tc = parseTestCase(line, idx + 1);
+    if (tc) allItems.push(tc);
+  });
+
+  const rootItems: TestCase[] = [];
+  const stack: { item: TestCase; indent: number }[] = [];
+
+  for (const item of allItems) {
+    if (item.isHeading) {
+      // Headings are always root-level; use indent:-1 so all following items become children
+      rootItems.push(item);
+      stack.length = 0;
+      stack.push({ item, indent: -1 });
+    } else {
+      while (stack.length > 0 && stack[stack.length - 1].indent >= item.indent) {
+        stack.pop();
+      }
+
+      if (stack.length > 0) {
+        stack[stack.length - 1].item.children.push(item);
+        stack[stack.length - 1].item.hasChildren = true;
+      } else {
+        rootItems.push(item);
+      }
+
+      stack.push({ item, indent: item.indent });
+    }
+  }
+
+  return rootItems;
+}
+
+function countLeafTestCases(items: TestCase[]): number {
+  let count = 0;
+  for (const tc of items) {
+    if (!tc.isHeading) count++;
+    count += countLeafTestCases(tc.children);
+  }
+  return count;
+}
+
+function getAllTags(testCases: TestCase[]): string[] {
+  const tagSet = new Set<string>();
+  const collect = (items: TestCase[]) => {
+    items.forEach((tc) => {
+      if (!tc.isHeading) tc.tags.forEach((t) => tagSet.add(t));
+      if (tc.children.length > 0) collect(tc.children);
+    });
+  };
+  collect(testCases);
+  return Array.from(tagSet).sort();
+}
+
+/**
+ * Filter by include/exclude tags.
+ * includeTags: OR logic — item must match at least one (if any specified)
+ * excludeTags: item is dropped if it matches any excluded tag
+ */
+function filterByTags(
+  testCases: TestCase[],
+  includeTags: string[],
+  excludeTags: string[]
+): TestCase[] {
+  if (includeTags.length === 0 && excludeTags.length === 0) return testCases;
+
+  const filtered: TestCase[] = [];
+
+  for (const tc of testCases) {
+    if (tc.isHeading) {
+      const filteredChildren = filterByTags(tc.children, includeTags, excludeTags);
+      if (filteredChildren.length > 0) {
+        filtered.push({ ...tc, children: filteredChildren, hasChildren: true });
+      }
+      continue;
+    }
+
+    if (excludeTags.length > 0 && excludeTags.some((tag) => tc.tags.includes(tag))) continue;
+
+    if (includeTags.length === 0) {
+      filtered.push(tc);
+    } else {
+      const matchesInclude = includeTags.some((tag) => tc.tags.includes(tag));
+      if (matchesInclude) {
+        filtered.push(tc);
+      } else if (tc.hasChildren) {
+        const hasMatchingChild = tc.children.some(
+          (child) =>
+            includeTags.some((tag) => child.tags.includes(tag)) &&
+            !excludeTags.some((tag) => child.tags.includes(tag))
+        );
+        if (hasMatchingChild) filtered.push(tc);
+      }
+    }
+  }
+
+  return filtered;
+}
+
+function generateChecklist(
+  testCases: TestCase[],
+  projectName: string,
+  includeTags: string[],
+  excludeTags: string[]
+): string {
+  const timestamp = new Date().toLocaleString();
+  let filterLine = "";
+  if (includeTags.length > 0)
+    filterLine += `\n**Include:** ${includeTags.map((t) => `@${t}`).join(" ")}`;
+  if (excludeTags.length > 0)
+    filterLine += `\n**Exclude:** ${excludeTags.map((t) => `@${t}`).join(" ")}`;
+
+  let md = `# Test Run: ${projectName}\n`;
+  md += `**Date:** ${timestamp}${filterLine}\n`;
+
+  md += `**Total Cases:** ${countLeafTestCases(testCases)}\n\n`;
+  md += "---\n\n";
+
+  function renderItems(items: TestCase[], depth: number): string {
+    let result = "";
+    for (const tc of items) {
+      if (tc.isHeading) {
+        const hashes = "#".repeat(tc.headingLevel || 2);
+        result += `\n${hashes} ${tc.name}\n\n`;
+        if (tc.children.length > 0) result += renderItems(tc.children, depth);
+        continue;
+      }
+      const indent = "  ".repeat(depth);
+      const tagsStr = tc.tags.map((t) => `@${t}`).join(" ");
+      if (depth === 0) {
+        result += `- [ ] **${tc.name}** ${tagsStr}\n`;
+      } else {
+        result += `${indent}- ${tc.name} ${tagsStr}\n`;
+      }
+      if (tc.children.length > 0) result += renderItems(tc.children, depth + 1);
+    }
+    return result;
+  }
+
+  md += renderItems(testCases, 0);
+  md += "\n---\n\n";
+
+  return md;
+}
+
+// Labels stamped into the file when a custom status is set
+const STATUS_LABEL_MAP: Record<string, string> = {
+  p: "✅ Pass", P: "✅ Pass",
+  f: "❌ Fail", F: "❌ Fail",
+  s: "⏭️ Skipped", S: "⏭️ Skipped",
+  b: "🚫 Blocked", B: "🚫 Blocked",
+};
+
+// Matches any label prefix we may have written (all historical formats, circles included)
+const EXISTING_LABEL_RE = /^(✅ Pass|❌ Fail|⏭️ Skipped|🚫 Blocked|🟢 Pass|🔴 Fail|🟡 Skipped|🟣 Blocked)( 📅 \d{4}-\d{2}-\d{2})? \| /;
+
+function applyStatusLabel(line: string): string {
+  const match = line.match(/^(- \[([^\]]+)\] )([^]*)/);
+  if (!match) return line;
+
+  const [, cbPart, statusChar, rest] = match;
+  const newLabel = STATUS_LABEL_MAP[statusChar];
+
+  const existingMatch = rest.match(EXISTING_LABEL_RE);
+  const existingLabel = existingMatch?.[1];
+
+  if (existingLabel === newLabel) return line;
+
+  // Strip old label prefix (including any embedded date from old format)
+  const cleanRest = rest.replace(EXISTING_LABEL_RE, "").replace(/\s+$/, "");
+
+  if (!newLabel) {
+    return `${cbPart}${cleanRest}`;
+  }
+
+  return `${cbPart}${newLabel} | ${cleanRest}`;
+}
+
+// Emojis in the results table — match the in-line status stamps
+const STATUS_EMOJI: Record<string, string> = {
+  pass: "✅", fail: "❌", skipped: "⏭️", blocked: "🚫", notrun: "⬜",
+};
+
+const STATUS_PATTERNS: Array<{ regex: RegExp; key: string; label: string }> = [
+  { regex: /^- \[[xXpP]\]/, key: "pass",    label: "Pass"    },
+  { regex: /^- \[[fF]\]/,   key: "fail",    label: "Fail"    },
+  { regex: /^- \[[sS]\]/,   key: "skipped", label: "Skipped" },
+  { regex: /^- \[[bB]\]/,   key: "blocked", label: "Blocked" },
+  { regex: /^- \[ \]/,      key: "notrun",  label: "Not Run" },
+];
+
+function calculateResults(content: string): string {
+  const counts: Record<string, number> = { pass: 0, fail: 0, skipped: 0, blocked: 0, notrun: 0 };
+
+  content.split("\n").forEach((line) => {
+    const trimmed = line.trim();
+    for (const s of STATUS_PATTERNS) {
+      if (s.regex.test(trimmed)) { counts[s.key]++; break; }
+    }
+  });
+
+  const total = (Object.keys(counts) as string[]).reduce((a, k) => a + counts[k], 0);
+  if (total === 0) return "";
+
+  const rows = STATUS_PATTERNS
+    .filter((s) => counts[s.key] > 0)
+    .map((s) => {
+      const pct = `${((counts[s.key] / total) * 100).toFixed(1)}%`;
+      return `| ${STATUS_EMOJI[s.key]} ${s.label} | ${counts[s.key]} | ${pct} |`;
+    })
+    .join("\n");
+
+  // Flexible cleanup: handles any prior format of the stats block
+  let cleaned = content.replace(/\n+---\n+## Test Results Statistics[\s\S]*$/, "");
+  cleaned = cleaned.replace(/\s+$/, "");
+
+  return cleaned + `\n\n---\n\n## Test Results Statistics\n\n| Status | Count | % |\n| --- | --- | --- |\n${rows}\n| **Total** | **${total}** | |\n`;
+}
+
+// ─── Modals ──────────────────────────────────────────────────────────────────
+
+/** Folder picker for settings */
+class FolderSuggestModal extends SuggestModal<TFolder> {
+  constructor(app: App, private callback: (path: string) => void) {
+    super(app);
+    this.setPlaceholder("Type to search folders…");
+  }
+
+  getSuggestions(query: string): TFolder[] {
+    return this.app.vault.getAllLoadedFiles()
+      .filter((f): f is TFolder => f instanceof TFolder && f.path.toLowerCase().includes(query.toLowerCase()));
+  }
+
+  renderSuggestion(folder: TFolder, el: HTMLElement) {
+    el.createEl("div", { text: folder.path || "/" });
+  }
+
+  onChooseSuggestion(folder: TFolder) {
+    this.callback(folder.path);
+  }
+}
+
+/** Tag selection with 3-state cycling: neutral → include (green) → exclude (red) → neutral */
+class TagSelectModal extends Modal {
+  private tagStates: Map<string, TagState> = new Map();
+  private chipElements: Map<string, HTMLElement> = new Map();
+
+  constructor(
+    app: App,
+    private allTags: string[],
+    private projectName: string,
+    private callback: (includeTags: string[], excludeTags: string[]) => void,
+    initialIncludeTags: string[] = [],
+    initialExcludeTags: string[] = []
+  ) {
+    super(app);
+    allTags.forEach((tag) => {
+      if (initialIncludeTags.includes(tag)) this.tagStates.set(tag, "include");
+      else if (initialExcludeTags.includes(tag)) this.tagStates.set(tag, "exclude");
+      else this.tagStates.set(tag, "neutral");
+    });
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h2", { text: `Select Attributes: ${this.projectName}` });
+    contentEl.createEl("p", {
+      text: "Click once: include (green)  ·  twice: exclude (red)  ·  three times: reset",
+      cls: "mod-note",
+    });
+
+    const controlsDiv = contentEl.createDiv({ cls: "qa-tag-controls" });
+    new Setting(controlsDiv)
+      .addButton((btn) => btn.setButtonText("Include All").onClick(() => this.setAll("include")))
+      .addButton((btn) => btn.setButtonText("Reset All").onClick(() => this.setAll("neutral")));
+
+    const tagsContainer = contentEl.createDiv({ cls: "qa-tags-container" });
+    this.allTags.forEach((tag) => {
+      const chip = tagsContainer.createEl("span", { text: `@${tag}`, cls: "qa-tag-chip" });
+      this.chipElements.set(tag, chip);
+      this.updateChip(tag);
+      chip.addEventListener("click", () => this.cycleTagState(tag));
+    });
+
+    if (this.allTags.length === 0) {
+      contentEl.createEl("p", { text: "No attributes found in this project.", cls: "mod-note" });
+    }
+
+    new Setting(contentEl).addButton((btn) =>
+      btn
+        .setButtonText("Next: Review Tests →")
+        .setCta()
+        .onClick(() => {
+          const includeTags = this.allTags.filter((t) => this.tagStates.get(t) === "include");
+          const excludeTags = this.allTags.filter((t) => this.tagStates.get(t) === "exclude");
+          this.callback(includeTags, excludeTags);
+          this.close();
+        })
+    );
+  }
+
+  private cycleTagState(tag: string) {
+    const current = this.tagStates.get(tag) ?? "neutral";
+    const next: TagState =
+      current === "neutral" ? "include" : current === "include" ? "exclude" : "neutral";
+    this.tagStates.set(tag, next);
+    this.updateChip(tag);
+  }
+
+  private setAll(state: TagState) {
+    this.allTags.forEach((tag) => {
+      this.tagStates.set(tag, state);
+      this.updateChip(tag);
+    });
+  }
+
+  private updateChip(tag: string) {
+    const chip = this.chipElements.get(tag);
+    if (!chip) return;
+    chip.removeClass("included", "excluded");
+    const state = this.tagStates.get(tag);
+    if (state === "include") chip.addClass("included");
+    else if (state === "exclude") chip.addClass("excluded");
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+/**
+ * Review modal: shows ALL test cases.
+ * Cases matching the tag filter are pre-checked; others are unchecked.
+ * User can manually toggle any item.
+ */
+class TestReviewModal extends Modal {
+  private checkedItems: Set<number> = new Set();
+  private checkboxRefs: Array<{ lineNumber: number; cb: HTMLInputElement }> = [];
+
+  constructor(
+    app: App,
+    private projectName: string,
+    private allTestCases: TestCase[],
+    filteredTestCases: TestCase[],
+    private includeTags: string[],
+    private excludeTags: string[],
+    private onConfirm: (selectedCases: TestCase[]) => void,
+    private onBack: () => void
+  ) {
+    super(app);
+    // Pre-check only non-heading filtered cases
+    const addChecked = (items: TestCase[]) => {
+      for (const tc of items) {
+        if (!tc.isHeading) this.checkedItems.add(tc.lineNumber);
+        if (tc.children.length > 0) addChecked(tc.children);
+      }
+    };
+    addChecked(filteredTestCases);
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h2", { text: `Review Tests: ${this.projectName}` });
+
+    const filterParts: string[] = [];
+    if (this.includeTags.length > 0)
+      filterParts.push(`Include: ${this.includeTags.map((t) => `@${t}`).join(" ")}`);
+    if (this.excludeTags.length > 0)
+      filterParts.push(`Exclude: ${this.excludeTags.map((t) => `@${t}`).join(" ")}`);
+
+    if (filterParts.length > 0) {
+      const summary = contentEl.createDiv({ cls: "qa-summary" });
+      filterParts.forEach((p) => summary.createEl("p", { text: p }));
+    } else {
+      contentEl.createEl("p", { text: "No tag filter — all test cases shown.", cls: "mod-note" });
+    }
+
+    const totalTestCount = countLeafTestCases(this.allTestCases);
+    const counterEl = contentEl.createEl("p", { cls: "qa-review-counter" });
+    const updateCounter = () => {
+      counterEl.textContent = `${this.checkedItems.size} / ${totalTestCount} tests selected`;
+    };
+    updateCounter();
+
+    const listEl = contentEl.createDiv({ cls: "qa-review-list" });
+    this.checkboxRefs = [];
+
+    // isCheckable=true means items at this level get checkboxes (not bullets)
+    const renderTree = (items: TestCase[], container: HTMLElement, isCheckable: boolean, childDepth: number) => {
+      items.forEach((tc: TestCase) => {
+        if (tc.isHeading) {
+          const headingEl = container.createDiv({ cls: "qa-review-section-heading" });
+          const level = Math.min(tc.headingLevel || 2, 6) as 1|2|3|4|5|6;
+          headingEl.createEl(`h${level}`, { text: tc.name, cls: "qa-review-heading-text" });
+          if (tc.children.length > 0) renderTree(tc.children, container, true, 0);
+          return;
+        }
+
+        const itemEl = container.createDiv({ cls: "qa-review-item" });
+        itemEl.style.paddingLeft = `${12 + childDepth * 20}px`;
+
+        if (isCheckable) {
+          const cb = itemEl.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
+          cb.checked = this.checkedItems.has(tc.lineNumber);
+          cb.addEventListener("change", () => {
+            if (cb.checked) this.checkedItems.add(tc.lineNumber);
+            else this.checkedItems.delete(tc.lineNumber);
+            updateCounter();
+          });
+          this.checkboxRefs.push({ lineNumber: tc.lineNumber, cb });
+        } else {
+          const bullet = itemEl.createEl("span");
+          bullet.style.marginRight = "6px";
+          bullet.style.color = "var(--text-faint)";
+          bullet.textContent = "·";
+        }
+
+        if (tc.hasChildren) {
+          const childrenEl = document.createElement("div");
+          let expanded = false;
+
+          const toggle = itemEl.createEl("span");
+          toggle.style.cursor = "pointer";
+          toggle.style.marginRight = "4px";
+          toggle.style.userSelect = "none";
+          toggle.style.color = "var(--text-muted)";
+          toggle.textContent = "▶";
+          toggle.addEventListener("click", (e) => {
+            e.stopPropagation();
+            expanded = !expanded;
+            toggle.textContent = expanded ? "▼" : "▶";
+            childrenEl.style.display = expanded ? "" : "none";
+          });
+
+          const labelEl = itemEl.createEl("label");
+          labelEl.style.cursor = "pointer";
+          labelEl.createSpan({ text: tc.name });
+          if (tc.tags.length > 0) {
+            labelEl.createEl("span", {
+              text: "  " + tc.tags.map((t: string) => `@${t}`).join(" "),
+              cls: "qa-review-item-tags",
+            });
+          }
+          if (isCheckable) {
+            labelEl.addEventListener("click", () => {
+              const cb = this.checkboxRefs.find((r) => r.lineNumber === tc.lineNumber)?.cb;
+              if (cb) { cb.checked = !cb.checked; cb.dispatchEvent(new Event("change")); }
+            });
+          }
+
+          childrenEl.style.display = "none";
+          container.appendChild(childrenEl);
+          renderTree(tc.children, childrenEl, false, childDepth + 1);
+        } else {
+          const labelEl = itemEl.createEl("label");
+          labelEl.style.cursor = isCheckable ? "pointer" : "default";
+          labelEl.createSpan({ text: tc.name });
+          if (tc.tags.length > 0) {
+            labelEl.createEl("span", {
+              text: "  " + tc.tags.map((t: string) => `@${t}`).join(" "),
+              cls: "qa-review-item-tags",
+            });
+          }
+          if (isCheckable) {
+            labelEl.addEventListener("click", () => {
+              const cb = this.checkboxRefs.find((r) => r.lineNumber === tc.lineNumber)?.cb;
+              if (cb) { cb.checked = !cb.checked; cb.dispatchEvent(new Event("change")); }
+            });
+          }
+        }
+      });
+    };
+
+    renderTree(this.allTestCases, listEl, true, 0);
+
+    new Setting(contentEl)
+      .addButton((btn) =>
+        btn.setButtonText("← Back").onClick(() => {
+          this.close();
+          this.onBack();
+        })
+      )
+      .addButton((btn) =>
+        btn
+          .setButtonText("Generate Test Run")
+          .setCta()
+          .onClick(() => {
+            const collectSelected = (items: TestCase[]): TestCase[] => {
+              const result: TestCase[] = [];
+              for (const tc of items) {
+                if (tc.isHeading) {
+                  const selectedChildren = collectSelected(tc.children);
+                  if (selectedChildren.length > 0) result.push({ ...tc, children: selectedChildren, hasChildren: true });
+                } else if (this.checkedItems.has(tc.lineNumber)) {
+                  result.push({ ...tc, children: collectSelected(tc.children) });
+                }
+              }
+              return result;
+            };
+            const selected = collectSelected(this.allTestCases);
+            if (countLeafTestCases(selected) === 0) {
+              new Notice("No test cases selected.");
+              return;
+            }
+            this.onConfirm(selected);
+            this.close();
+          })
+      );
+  }
+
+  private countDescendants(tc: TestCase): number {
+    let count = tc.children.length;
+    tc.children.forEach((child) => (count += this.countDescendants(child)));
+    return count;
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// ─── Attribute Autocomplete ──────────────────────────────────────────────────
+
+class AttributeSuggest extends EditorSuggest<string> {
+  private index: Set<string> = new Set();
+
+  constructor(plugin: QAChecklistPlugin) {
+    super(plugin.app);
+    this.buildIndex();
+    plugin.registerEvent(
+      plugin.app.vault.on("modify", (file) => {
+        if (file instanceof TFile && file.extension === "md") this.updateFile(file);
+      })
+    );
+  }
+
+  private async buildIndex() {
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      await this.updateFile(file);
+    }
+  }
+
+  private async updateFile(file: TFile) {
+    const content = await this.app.vault.cachedRead(file);
+    const tagRegex = /@([\p{L}\p{N}_-]+)/gu;
+    let m: RegExpExecArray | null;
+    while ((m = tagRegex.exec(content)) !== null) this.index.add(m[1].toLowerCase());
+  }
+
+  onTrigger(cursor: EditorPosition, editor: Editor, _file: TFile): EditorSuggestTriggerInfo | null {
+    const sub = editor.getLine(cursor.line).substring(0, cursor.ch);
+    const match = sub.match(/@([\p{L}\p{N}_-]*)$/u);
+    if (!match) return null;
+    return {
+      start: { line: cursor.line, ch: cursor.ch - match[0].length },
+      end: cursor,
+      query: match[1],
+    };
+  }
+
+  getSuggestions(context: EditorSuggestContext): string[] {
+    const query = context.query.toLowerCase();
+    return Array.from(this.index)
+      .filter((t) => t.startsWith(query) && t !== query)
+      .sort();
+  }
+
+  renderSuggestion(value: string, el: HTMLElement) {
+    el.createEl("span", { text: `@${value}` });
+  }
+
+  selectSuggestion(value: string) {
+    const { editor, start, end } = this.context!;
+    editor.replaceRange(`@${value}`, start, end);
+  }
+}
+
+// ─── Settings ────────────────────────────────────────────────────────────────
+
+interface QAChecklistSettings {
+  defaultTestRunFolder: string;
+  showRibbonTestRun: boolean;
+  showRibbonResults: boolean;
+  showStatusBarTestRun: boolean;
+  showStatusBarResults: boolean;
+}
+
+const DEFAULT_SETTINGS: QAChecklistSettings = {
+  defaultTestRunFolder: "",
+  showRibbonTestRun: true,
+  showRibbonResults: true,
+  showStatusBarTestRun: true,
+  showStatusBarResults: true,
+};
+
+// ─── Main Plugin ─────────────────────────────────────────────────────────────
+
+export default class QAChecklistPlugin extends Plugin {
+  settings: QAChecklistSettings = Object.assign({}, DEFAULT_SETTINGS);
+  private ribbonTestRun: HTMLElement | null = null;
+  private ribbonResults: HTMLElement | null = null;
+  private statusBarTestRun: HTMLElement | null = null;
+  private statusBarResults: HTMLElement | null = null;
+  private processingFiles = new Set<string>();
+
+  async onload() {
+    const loadedData = await this.loadData();
+    if (loadedData) {
+      this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
+    }
+
+    this.addCommand({
+      id: "generate-test-run-current",
+      name: "Test Run",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) return false;
+        if (checking) return true;
+        this.generateTestRun(file);
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: "calculate-test-results",
+      name: "Results",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) return false;
+        if (file.extension !== "md") return false;
+        if (checking) return true;
+        this.calculateTestResults();
+        return true;
+      },
+    });
+
+    // Ribbon icons
+    this.ribbonTestRun = this.addRibbonIcon("test-tube", "Test Run", () => {
+      const file = this.app.workspace.getActiveFile();
+      if (file) this.generateTestRun(file);
+      else new Notice("No active file open.");
+    });
+    this.ribbonResults = this.addRibbonIcon("bar-chart", "Results", () => {
+      this.calculateTestResults();
+    });
+    this.applyVisibility();
+
+    this.addSettingTab(new QAChecklistSettingTab(this.app, this));
+    this.registerEditorSuggest(new AttributeSuggest(this));
+
+    // Auto-stamp status label when status changes
+    this.registerEvent(
+      this.app.vault.on("modify", async (abstractFile) => {
+        if (!(abstractFile instanceof TFile) || abstractFile.extension !== "md") return;
+        if (this.processingFiles.has(abstractFile.path)) return;
+
+        const content = await this.app.vault.cachedRead(abstractFile);
+        if (!content.includes("- [")) return;
+
+        const updated = content.split("\n").map((l) => applyStatusLabel(l)).join("\n");
+        if (updated === content) return;
+
+        this.processingFiles.add(abstractFile.path);
+        await this.app.vault.modify(abstractFile, updated);
+        setTimeout(() => this.processingFiles.delete(abstractFile.path), 300);
+      })
+    );
+
+    // Status bar buttons
+    this.statusBarTestRun = this.addStatusBarItem();
+    this.statusBarTestRun.addClass("qa-status-bar-btn");
+    this.statusBarTestRun.setAttribute("title", "Test Run");
+    this.statusBarTestRun.textContent = "🧪 Test Run";
+    this.statusBarTestRun.addEventListener("click", () => {
+      const file = this.app.workspace.getActiveFile();
+      if (file) this.generateTestRun(file);
+      else new Notice("No active file open.");
+    });
+
+    this.statusBarResults = this.addStatusBarItem();
+    this.statusBarResults.addClass("qa-status-bar-btn");
+    this.statusBarResults.setAttribute("title", "Results");
+    this.statusBarResults.textContent = "📊 Results";
+    this.statusBarResults.addEventListener("click", () => this.calculateTestResults());
+
+    this.applyVisibility();
+  }
+
+  applyVisibility() {
+    const toggle = (el: HTMLElement | null, show: boolean) => {
+      if (!el) return;
+      el.style.display = show ? "" : "none";
+    };
+    toggle(this.ribbonTestRun,   this.settings.showRibbonTestRun);
+    toggle(this.ribbonResults,   this.settings.showRibbonResults);
+    toggle(this.statusBarTestRun, this.settings.showStatusBarTestRun);
+    toggle(this.statusBarResults, this.settings.showStatusBarResults);
+  }
+
+  /** Main flow: parse → select tags (3-state) → review with checkboxes → create test run. */
+  private async generateTestRun(file: TFile) {
+    const content = await this.app.vault.read(file);
+    const testCases = parseTestCases(content);
+
+    if (testCases.length === 0) {
+      new Notice("No test cases found in this file.");
+      return;
+    }
+
+    const allTags = getAllTags(testCases);
+    const projectName = file.basename;
+
+    const openTagSelect = (prevInclude: string[] = [], prevExclude: string[] = []) => {
+      new TagSelectModal(this.app, allTags, projectName, (includeTags, excludeTags) => {
+        const filtered = filterByTags(testCases, includeTags, excludeTags);
+
+        new TestReviewModal(
+          this.app,
+          projectName,
+          testCases,
+          filtered,
+          includeTags,
+          excludeTags,
+          async (selectedCases: TestCase[]) => {
+            const checklist = generateChecklist(selectedCases, projectName, includeTags, excludeTags);
+            const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+            const newFileName = `${projectName} - Test Run ${timestamp}.md`;
+
+            const folder = this.settings.defaultTestRunFolder.trim().replace(/\/+$/, "");
+            const filePath = folder ? `${folder}/${newFileName}` : newFileName;
+
+            if (folder && !this.app.vault.getAbstractFileByPath(folder)) {
+              await this.app.vault.createFolder(folder);
+            }
+
+            const newFile = await this.app.vault.create(filePath, checklist);
+            const leaf = this.app.workspace.getLeaf();
+            await leaf.openFile(newFile);
+
+            new Notice(`Test Run created: ${filePath}`);
+          },
+          () => openTagSelect(includeTags, excludeTags)
+        ).open();
+      }, prevInclude, prevExclude).open();
+    };
+
+    openTagSelect();
+  }
+
+  private async calculateTestResults() {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) return;
+
+    const content = await this.app.vault.read(file);
+    const updatedContent = calculateResults(content);
+
+    if (!updatedContent) {
+      new Notice("No checklist items found in this file.");
+      return;
+    }
+
+    await this.app.vault.modify(file, updatedContent);
+    new Notice("Test results calculated!");
+  }
+}
+
+// ─── Settings Tab ────────────────────────────────────────────────────────────
+
+class QAChecklistSettingTab extends PluginSettingTab {
+  plugin: QAChecklistPlugin;
+
+  constructor(app: App, plugin: QAChecklistPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+
+    containerEl.createEl("h2", { text: "Test Manager Settings" });
+
+    // ── Storage ──────────────────────────────────────────────────────────────
+    containerEl.createEl("h3", { text: "Storage" });
+
+    new Setting(containerEl)
+      .setName("Test Run folder")
+      .setDesc("Folder where generated test runs are saved. Leave empty for vault root.")
+      .addText((text) => {
+        text
+          .setPlaceholder("e.g. Test Runs")
+          .setValue(this.plugin.settings.defaultTestRunFolder);
+        text.inputEl.style.width = "200px";
+        text.onChange(async (value) => {
+          this.plugin.settings.defaultTestRunFolder = value;
+          await this.plugin.saveData(this.plugin.settings);
+        });
+      })
+      .addButton((btn) =>
+        btn.setButtonText("Browse…").onClick(() => {
+          new FolderSuggestModal(this.app, async (path) => {
+            this.plugin.settings.defaultTestRunFolder = path;
+            await this.plugin.saveData(this.plugin.settings);
+            this.display();
+          }).open();
+        })
+      );
+
+    // ── Buttons ───────────────────────────────────────────────────────────────
+    containerEl.createEl("h3", { text: "Buttons" });
+
+    const toggles: Array<{ name: string; key: keyof QAChecklistSettings }> = [
+      { name: "Ribbon: Test Run",    key: "showRibbonTestRun"    },
+      { name: "Ribbon: Results",     key: "showRibbonResults"    },
+      { name: "Status bar: Test Run", key: "showStatusBarTestRun" },
+      { name: "Status bar: Results",  key: "showStatusBarResults" },
+    ];
+
+    for (const { name, key } of toggles) {
+      new Setting(containerEl)
+        .setName(name)
+        .addToggle((toggle) =>
+          toggle.setValue(this.plugin.settings[key] as boolean).onChange(async (value) => {
+            (this.plugin.settings as unknown as Record<string, unknown>)[key] = value;
+            await this.plugin.saveData(this.plugin.settings);
+            this.plugin.applyVisibility();
+          })
+        );
+    }
+
+    // ── Hotkeys ───────────────────────────────────────────────────────────────
+    containerEl.createEl("h3", { text: "Hotkeys" });
+    const desc = containerEl.createEl("p", { cls: "mod-note" });
+    desc.appendText("To set keyboard shortcuts for ");
+    desc.createEl("strong", { text: "Test Run" });
+    desc.appendText(" and ");
+    desc.createEl("strong", { text: "Results" });
+    desc.appendText(" commands, go to ");
+    desc.createEl("strong", { text: "Settings → Hotkeys" });
+    desc.appendText(' and search for "Test Manager".');
+  }
+}
