@@ -55,16 +55,21 @@ function parseTestCase(line: string, lineNumber: number): TestCase | null {
   const spaceCount = (leadingWhitespace.match(/ /g) || []).length;
   const indent = tabCount + Math.floor(spaceCount / 2);
 
+  const normalized = trimmed
+    .replace(/^-\s*\[[^\]]*\]\s*/, "")
+    .replace(/^(✅ Pass|❌ Fail|⏭️ Skipped|🚫 Blocked)\s*\|\s*/, "")
+    .replace(/^\*\*(.*?)\*\*(.*)$/, "$1$2");
+
   const tagRegex = /@([\p{L}\p{N}_-]+)/gu;
   const tags: string[] = [];
   let match: RegExpExecArray | null;
 
-  while ((match = tagRegex.exec(trimmed)) !== null) {
+  while ((match = tagRegex.exec(normalized)) !== null) {
     tags.push(match[1].toLowerCase());
   }
 
-  const firstTagIndex = trimmed.search(/@[\p{L}\p{N}_-]+/u);
-  const name = firstTagIndex >= 0 ? trimmed.slice(0, firstTagIndex).trim() : trimmed;
+  const firstTagIndex = normalized.search(/@[\p{L}\p{N}_-]+/u);
+  const name = firstTagIndex >= 0 ? normalized.slice(0, firstTagIndex).trim() : normalized;
 
   return { line: trimmed, name, tags, lineNumber, indent, children: [], hasChildren: false };
 }
@@ -603,7 +608,7 @@ class TestReviewModal extends Modal {
 class AttributeSuggest extends EditorSuggest<string> {
   private index: Set<string> = new Set();
 
-  constructor(plugin: QAChecklistPlugin) {
+  constructor(plugin: TMSPlugin) {
     super(plugin.app);
     this.buildIndex();
     plugin.registerEvent(
@@ -656,7 +661,7 @@ class AttributeSuggest extends EditorSuggest<string> {
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
-interface QAChecklistSettings {
+interface TMSSettings {
   defaultTestRunFolder: string;
   showRibbonTestRun: boolean;
   showRibbonResults: boolean;
@@ -664,7 +669,7 @@ interface QAChecklistSettings {
   showStatusBarResults: boolean;
 }
 
-const DEFAULT_SETTINGS: QAChecklistSettings = {
+const DEFAULT_SETTINGS: TMSSettings = {
   defaultTestRunFolder: "",
   showRibbonTestRun: true,
   showRibbonResults: true,
@@ -674,8 +679,8 @@ const DEFAULT_SETTINGS: QAChecklistSettings = {
 
 // ─── Main Plugin ─────────────────────────────────────────────────────────────
 
-export default class QAChecklistPlugin extends Plugin {
-  settings: QAChecklistSettings = Object.assign({}, DEFAULT_SETTINGS);
+export default class TMSPlugin extends Plugin {
+  settings: TMSSettings = Object.assign({}, DEFAULT_SETTINGS);
   private ribbonTestRun: HTMLElement | null = null;
   private ribbonResults: HTMLElement | null = null;
   private statusBarTestRun: HTMLElement | null = null;
@@ -724,7 +729,7 @@ export default class QAChecklistPlugin extends Plugin {
     });
     this.applyVisibility();
 
-    this.addSettingTab(new QAChecklistSettingTab(this.app, this));
+    this.addSettingTab(new TMSSettingTab(this.app, this));
     this.registerEditorSuggest(new AttributeSuggest(this));
 
     // Auto-stamp status label when status changes
@@ -845,10 +850,10 @@ export default class QAChecklistPlugin extends Plugin {
 
 // ─── Settings Tab ────────────────────────────────────────────────────────────
 
-class QAChecklistSettingTab extends PluginSettingTab {
-  plugin: QAChecklistPlugin;
+class TMSSettingTab extends PluginSettingTab {
+  plugin: TMSPlugin;
 
-  constructor(app: App, plugin: QAChecklistPlugin) {
+  constructor(app: App, plugin: TMSPlugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
@@ -857,7 +862,7 @@ class QAChecklistSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Test Manager Settings" });
+    containerEl.createEl("h2", { text: "Test Management System Settings" });
 
     // ── Storage ──────────────────────────────────────────────────────────────
     containerEl.createEl("h3", { text: "Storage" });
@@ -888,7 +893,7 @@ class QAChecklistSettingTab extends PluginSettingTab {
     // ── Buttons ───────────────────────────────────────────────────────────────
     containerEl.createEl("h3", { text: "Buttons" });
 
-    const toggles: Array<{ name: string; key: keyof QAChecklistSettings }> = [
+    const toggles: Array<{ name: string; key: keyof TMSSettings }> = [
       { name: "Ribbon: Test Run",    key: "showRibbonTestRun"    },
       { name: "Ribbon: Results",     key: "showRibbonResults"    },
       { name: "Status bar: Test Run", key: "showStatusBarTestRun" },
@@ -916,6 +921,6 @@ class QAChecklistSettingTab extends PluginSettingTab {
     desc.createEl("strong", { text: "Results" });
     desc.appendText(" commands, go to ");
     desc.createEl("strong", { text: "Settings → Hotkeys" });
-    desc.appendText(' and search for "Test Manager".');
+    desc.appendText(' and search for "Test Management System".');
   }
 }

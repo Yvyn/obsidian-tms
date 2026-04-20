@@ -1,9 +1,10 @@
 {
-  "id": "qa-checklist",
-  "name": "Test Manager System",
+  "id": "tms",
+  "name": "Test Management System",
   "version": "1.0.0",
-  "minAppVersion": "1.0.0",
+  "minAppVersion": "0.15.0",
   "description": "Create QA projects with test cases and generate test runs based on tag filtering.",
-  "author": "yuriivynokurov",
+  "author": "Yvyn",
+  "authorUrl": "https://github.com/Yvyn",
   "isDesktopOnly": false
 }
