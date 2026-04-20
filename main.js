@@ -19,7 +19,7 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // src/main.ts
 var main_exports = {};
 __export(main_exports, {
-  default: () => QAChecklistPlugin
+  default: () => TMSPlugin
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
@@ -45,14 +45,15 @@ function parseTestCase(line, lineNumber) {
   const tabCount = (leadingWhitespace.match(/\t/g) || []).length;
   const spaceCount = (leadingWhitespace.match(/ /g) || []).length;
   const indent = tabCount + Math.floor(spaceCount / 2);
+  const normalized = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, "").replace(/^(✅ Pass|❌ Fail|⏭️ Skipped|🚫 Blocked)\s*\|\s*/, "").replace(/^\*\*(.*?)\*\*(.*)$/, "$1$2");
   const tagRegex = /@([\p{L}\p{N}_-]+)/gu;
   const tags = [];
   let match;
-  while ((match = tagRegex.exec(trimmed)) !== null) {
+  while ((match = tagRegex.exec(normalized)) !== null) {
     tags.push(match[1].toLowerCase());
   }
-  const firstTagIndex = trimmed.search(/@[\p{L}\p{N}_-]+/u);
-  const name = firstTagIndex >= 0 ? trimmed.slice(0, firstTagIndex).trim() : trimmed;
+  const firstTagIndex = normalized.search(/@[\p{L}\p{N}_-]+/u);
+  const name = firstTagIndex >= 0 ? normalized.slice(0, firstTagIndex).trim() : normalized;
   return { line: trimmed, name, tags, lineNumber, indent, children: [], hasChildren: false };
 }
 function parseTestCases(content) {
@@ -576,7 +577,7 @@ var DEFAULT_SETTINGS = {
   showStatusBarTestRun: true,
   showStatusBarResults: true
 };
-var QAChecklistPlugin = class extends import_obsidian.Plugin {
+var TMSPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     this.settings = Object.assign({}, DEFAULT_SETTINGS);
@@ -630,7 +631,7 @@ var QAChecklistPlugin = class extends import_obsidian.Plugin {
       this.calculateTestResults();
     });
     this.applyVisibility();
-    this.addSettingTab(new QAChecklistSettingTab(this.app, this));
+    this.addSettingTab(new TMSSettingTab(this.app, this));
     this.registerEditorSuggest(new AttributeSuggest(this));
     this.registerEvent(
       this.app.vault.on("modify", async (abstractFile) => {
@@ -732,7 +733,7 @@ var QAChecklistPlugin = class extends import_obsidian.Plugin {
     new import_obsidian.Notice("Test results calculated!");
   }
 };
-var QAChecklistSettingTab = class extends import_obsidian.PluginSettingTab {
+var TMSSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -740,7 +741,7 @@ var QAChecklistSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Test Manager Settings" });
+    containerEl.createEl("h2", { text: "Test Management System Settings" });
     containerEl.createEl("h3", { text: "Storage" });
     new import_obsidian.Setting(containerEl).setName("Test Run folder").setDesc("Folder where generated test runs are saved. Leave empty for vault root.").addText((text) => {
       text.setPlaceholder("e.g. Test Runs").setValue(this.plugin.settings.defaultTestRunFolder);
@@ -782,6 +783,6 @@ var QAChecklistSettingTab = class extends import_obsidian.PluginSettingTab {
     desc.createEl("strong", { text: "Results" });
     desc.appendText(" commands, go to ");
     desc.createEl("strong", { text: "Settings \u2192 Hotkeys" });
-    desc.appendText(' and search for "Test Manager".');
+    desc.appendText(' and search for "Test Management System".');
   }
 };
