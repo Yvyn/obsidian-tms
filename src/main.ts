@@ -84,27 +84,39 @@ function parseTestCases(content: string): TestCase[] {
   });
 
   const rootItems: TestCase[] = [];
-  const stack: { item: TestCase; indent: number }[] = [];
+  const headingStack: { item: TestCase; level: number }[] = [];
+  const indentStack: { item: TestCase; indent: number }[] = [];
 
   for (const item of allItems) {
     if (item.isHeading) {
-      // Headings are always root-level; use indent:-1 so all following items become children
-      rootItems.push(item);
-      stack.length = 0;
-      stack.push({ item, indent: -1 });
-    } else {
-      while (stack.length > 0 && stack[stack.length - 1].indent >= item.indent) {
-        stack.pop();
+      indentStack.length = 0;
+      while (headingStack.length > 0 && headingStack[headingStack.length - 1].level >= item.headingLevel!) {
+        headingStack.pop();
       }
-
-      if (stack.length > 0) {
-        stack[stack.length - 1].item.children.push(item);
-        stack[stack.length - 1].item.hasChildren = true;
+      if (headingStack.length > 0) {
+        const parent = headingStack[headingStack.length - 1].item;
+        parent.children.push(item);
+        parent.hasChildren = true;
       } else {
         rootItems.push(item);
       }
-
-      stack.push({ item, indent: item.indent });
+      headingStack.push({ item, level: item.headingLevel! });
+    } else {
+      while (indentStack.length > 0 && indentStack[indentStack.length - 1].indent >= item.indent) {
+        indentStack.pop();
+      }
+      if (indentStack.length > 0) {
+        const parent = indentStack[indentStack.length - 1].item;
+        parent.children.push(item);
+        parent.hasChildren = true;
+      } else if (headingStack.length > 0) {
+        const parent = headingStack[headingStack.length - 1].item;
+        parent.children.push(item);
+        parent.hasChildren = true;
+      } else {
+        rootItems.push(item);
+      }
+      indentStack.push({ item, indent: item.indent });
     }
   }
 
@@ -130,6 +142,15 @@ function getAllTags(testCases: TestCase[]): string[] {
   };
   collect(testCases);
   return Array.from(tagSet).sort();
+}
+
+function collectLeafLineNumbers(items: TestCase[]): number[] {
+  const result: number[] = [];
+  for (const tc of items) {
+    if (!tc.isHeading) result.push(tc.lineNumber);
+    if (tc.children.length > 0) result.push(...collectLeafLineNumbers(tc.children));
+  }
+  return result;
 }
 
 /**
@@ -342,6 +363,7 @@ class TagSelectModal extends Modal {
   }
 
   onOpen() {
+    this.modalEl.addClass("qa-large-modal");
     const { contentEl } = this;
     contentEl.empty();
 
@@ -355,6 +377,19 @@ class TagSelectModal extends Modal {
     new Setting(controlsDiv)
       .addButton((btn) => btn.setButtonText("Include All").onClick(() => this.setAll("include")))
       .addButton((btn) => btn.setButtonText("Reset All").onClick(() => this.setAll("neutral")));
+
+    const searchInput = contentEl.createEl("input", {
+      attr: { type: "text", placeholder: "Search tags…" },
+      cls: "qa-tag-search",
+    }) as HTMLInputElement;
+    searchInput.addEventListener("input", () => {
+      const query = searchInput.value.toLowerCase().trim();
+      this.allTags.forEach((tag) => {
+        const chip = this.chipElements.get(tag);
+        if (!chip) return;
+        chip.style.display = !query || tag.includes(query) ? "" : "none";
+      });
+    });
 
     const tagsContainer = contentEl.createDiv({ cls: "qa-tags-container" });
     this.allTags.forEach((tag) => {
@@ -418,6 +453,7 @@ class TagSelectModal extends Modal {
 class TestReviewModal extends Modal {
   private checkedItems: Set<number> = new Set();
   private checkboxRefs: Array<{ lineNumber: number; cb: HTMLInputElement }> = [];
+  private headingCheckboxRefs: Array<{ lineNumbers: number[]; cb: HTMLInputElement; update: () => void }> = [];
 
   constructor(
     app: App,
@@ -441,6 +477,7 @@ class TestReviewModal extends Modal {
   }
 
   onOpen() {
+    this.modalEl.addClass("qa-large-modal");
     const { contentEl } = this;
     contentEl.empty();
 
@@ -469,19 +506,42 @@ class TestReviewModal extends Modal {
     const listEl = contentEl.createDiv({ cls: "qa-review-list" });
     this.checkboxRefs = [];
 
-    // isCheckable=true means items at this level get checkboxes (not bullets)
-    const renderTree = (items: TestCase[], container: HTMLElement, isCheckable: boolean, childDepth: number) => {
+    // parentHeadingLevel: heading level of the nearest ancestor heading (0 = root/no heading)
+    // childDepth: indentation depth for non-heading nesting (indented test cases)
+    const renderTree = (items: TestCase[], container: HTMLElement, isCheckable: boolean, childDepth: number, parentHeadingLevel: number = 0) => {
       items.forEach((tc: TestCase) => {
         if (tc.isHeading) {
           const headingEl = container.createDiv({ cls: "qa-review-section-heading" });
+          headingEl.style.paddingLeft = `${(tc.headingLevel! - 1) * 20 + 10}px`;
+          const leafLineNumbers = collectLeafLineNumbers(tc.children);
+          if (leafLineNumbers.length > 0) {
+            const headingCb = headingEl.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
+            headingCb.addClass("qa-heading-checkbox");
+            const updateHeadingCb = () => {
+              const n = leafLineNumbers.filter(ln => this.checkedItems.has(ln)).length;
+              headingCb.indeterminate = n > 0 && n < leafLineNumbers.length;
+              headingCb.checked = n === leafLineNumbers.length;
+            };
+            updateHeadingCb();
+            this.headingCheckboxRefs.push({ lineNumbers: leafLineNumbers, cb: headingCb, update: updateHeadingCb });
+            headingCb.addEventListener("change", () => {
+              if (headingCb.checked) leafLineNumbers.forEach(ln => this.checkedItems.add(ln));
+              else leafLineNumbers.forEach(ln => this.checkedItems.delete(ln));
+              this.checkboxRefs.forEach(ref => {
+                if (leafLineNumbers.includes(ref.lineNumber)) ref.cb.checked = this.checkedItems.has(ref.lineNumber);
+              });
+              updateCounter();
+              this.headingCheckboxRefs.forEach(ref => ref.update());
+            });
+          }
           const level = Math.min(tc.headingLevel || 2, 6) as 1|2|3|4|5|6;
           headingEl.createEl(`h${level}`, { text: tc.name, cls: "qa-review-heading-text" });
-          if (tc.children.length > 0) renderTree(tc.children, container, true, 0);
+          if (tc.children.length > 0) renderTree(tc.children, container, true, 0, tc.headingLevel!);
           return;
         }
 
         const itemEl = container.createDiv({ cls: "qa-review-item" });
-        itemEl.style.paddingLeft = `${12 + childDepth * 20}px`;
+        itemEl.style.paddingLeft = `${parentHeadingLevel * 20 + 12 + childDepth * 16}px`;
 
         if (isCheckable) {
           const cb = itemEl.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
@@ -490,6 +550,9 @@ class TestReviewModal extends Modal {
             if (cb.checked) this.checkedItems.add(tc.lineNumber);
             else this.checkedItems.delete(tc.lineNumber);
             updateCounter();
+            this.headingCheckboxRefs.forEach(ref => {
+              if (ref.lineNumbers.includes(tc.lineNumber)) ref.update();
+            });
           });
           this.checkboxRefs.push({ lineNumber: tc.lineNumber, cb });
         } else {
@@ -501,23 +564,26 @@ class TestReviewModal extends Modal {
 
         if (tc.hasChildren) {
           const childrenEl = document.createElement("div");
-          let expanded = false;
 
-          const toggle = itemEl.createEl("span");
-          toggle.style.cursor = "pointer";
-          toggle.style.marginRight = "4px";
-          toggle.style.userSelect = "none";
-          toggle.style.color = "var(--text-muted)";
-          toggle.textContent = "▶";
-          toggle.addEventListener("click", (e) => {
-            e.stopPropagation();
-            expanded = !expanded;
-            toggle.textContent = expanded ? "▼" : "▶";
-            childrenEl.style.display = expanded ? "" : "none";
-          });
+          if (isCheckable) {
+            let expanded = false;
+            const toggle = itemEl.createEl("span");
+            toggle.style.cursor = "pointer";
+            toggle.style.marginRight = "4px";
+            toggle.style.userSelect = "none";
+            toggle.style.color = "var(--text-muted)";
+            toggle.textContent = "▶";
+            toggle.addEventListener("click", (e) => {
+              e.stopPropagation();
+              expanded = !expanded;
+              toggle.textContent = expanded ? "▼" : "▶";
+              childrenEl.style.display = expanded ? "" : "none";
+            });
+            childrenEl.style.display = "none";
+          }
 
           const labelEl = itemEl.createEl("label");
-          labelEl.style.cursor = "pointer";
+          labelEl.style.cursor = isCheckable ? "pointer" : "default";
           labelEl.createSpan({ text: tc.name });
           if (tc.tags.length > 0) {
             labelEl.createEl("span", {
@@ -532,9 +598,8 @@ class TestReviewModal extends Modal {
             });
           }
 
-          childrenEl.style.display = "none";
           container.appendChild(childrenEl);
-          renderTree(tc.children, childrenEl, false, childDepth + 1);
+          renderTree(tc.children, childrenEl, false, childDepth + 1, parentHeadingLevel);
         } else {
           const labelEl = itemEl.createEl("label");
           labelEl.style.cursor = isCheckable ? "pointer" : "default";
@@ -555,7 +620,7 @@ class TestReviewModal extends Modal {
       });
     };
 
-    renderTree(this.allTestCases, listEl, true, 0);
+    renderTree(this.allTestCases, listEl, true, 0, 0);
 
     new Setting(contentEl)
       .addButton((btn) =>
