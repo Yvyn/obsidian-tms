@@ -7,7 +7,8 @@ An Obsidian plugin for managing QA test cases — create test plans, filter by a
 - **Test Plans** — write test cases in regular `.md` files using headings and indentation
 - **Attribute Tags** — tag cases with `@smoke`, `@regression`, `@api`, etc.
 - **Autocomplete** — type `@` and get suggestions from all attributes in the vault
-- **Test Run Generator** — filter cases by tags (include/exclude), review the list, and generate a `.md` test run file
+- **Test Run Generator** — filter cases by tags (include/exclude) with live tag search, review the list with section checkboxes, and generate a `.md` test run file
+- **Section Selection** — each heading in the review modal has a checkbox to select/deselect all cases under it at once; indeterminate state shows partial selection
 - **Status Tracking** — mark cases as Pass `[p]`, Fail `[f]`, Skipped `[s]`, Blocked `[b]`; labels are added automatically
 - **Results Summary** — run the Results command to append a statistics table to the test run
 
@@ -32,8 +33,8 @@ DELETE /users @api @destructive
 
 1. Open a test plan file
 2. Run **TMS: Test Run** (command palette, ribbon 🧪, or status bar)
-3. Select attributes to include/exclude
-4. Review and adjust the case list
+3. Select attributes to include/exclude — use the search field to filter tags quickly
+4. Review and adjust the case list — use heading checkboxes to select entire sections at once
 5. Click **Generate Test Run** — a new `.md` file is created
 
 ### Running Tests

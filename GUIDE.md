@@ -115,6 +115,7 @@ A modal opens with all attributes found in the file.
 
 - **Include All** — mark all attributes as include
 - **Reset All** — reset all to neutral
+- **Search field** — type to filter the visible attribute chips by name
 
 **Filter logic:**
 - Include: OR — a case is included if it has at least one of the included attributes
@@ -130,6 +131,16 @@ A list of all test cases with sections. Cases matching the filter are pre-checke
 - Counter shows `N / Total selected`
 - **← Back** — return to attribute selection
 - **Generate Test Run** — create the test run file
+
+**Section checkboxes:** each heading (`#`, `##`, `###`, etc.) has a checkbox that selects or deselects all test cases under it at once.
+
+| Checkbox state | Meaning |
+|----------------|---------|
+| Checked ✓ | All cases in the section are selected |
+| Indeterminate — | Some cases are selected |
+| Unchecked | No cases in the section are selected |
+
+Headings are visually highlighted with a colored left border and bold text, scaled by level (`#` largest, `######` smallest).
 
 ### Step 3 — Result
 
