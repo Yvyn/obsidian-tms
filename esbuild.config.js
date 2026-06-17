@@ -13,6 +13,10 @@ async function build() {
       external: [
         "obsidian",
         "electron",
+        "child_process",
+        "os",
+        "path",
+        "fs",
         "@codemirror/autocomplete",
         "@codemirror/collab",
         "@codemirror/commands",

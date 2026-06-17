@@ -198,3 +198,58 @@
   background-color: var(--interactive-accent);
   color: white;
 }
+
+/* Playwright progress modal */
+.qa-pw-status {
+  font-weight: 600;
+  margin: 8px 0;
+}
+
+.qa-pw-output {
+  min-height: 60px;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--background-secondary);
+  border-radius: 4px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-family: var(--font-monospace);
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 8px 0 12px;
+  color: var(--text-muted);
+}
+
+/* Setup guide in settings */
+.qa-pw-guide {
+  background: var(--background-secondary);
+  border-radius: 6px;
+  padding: 14px 18px;
+  margin: 8px 0 16px;
+}
+
+.qa-pw-steps li {
+  margin-bottom: 12px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.qa-pw-steps ul {
+  margin-top: 6px;
+}
+
+.qa-pw-steps ul li {
+  margin-bottom: 2px;
+}
+
+.qa-pw-code {
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-family: var(--font-monospace);
+  margin: 8px 0 0;
+  white-space: pre;
+  overflow-x: auto;
+}
