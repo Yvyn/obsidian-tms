@@ -5,6 +5,7 @@ import {
   EditorSuggest,
   EditorSuggestContext,
   EditorSuggestTriggerInfo,
+  ItemView,
   Plugin,
   Modal,
   Notice,
@@ -13,6 +14,7 @@ import {
   Setting,
   SuggestModal,
   PluginSettingTab,
+  WorkspaceLeaf,
 } from "obsidian";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -27,6 +29,7 @@ interface TestCase {
   hasChildren: boolean;
   isHeading?: boolean;
   headingLevel?: number;
+  isManuallyAdded?: boolean;
 }
 
 type TagState = "neutral" | "include" | "exclude";
@@ -45,6 +48,8 @@ interface PwJsonReport { suites: PwSuite[] }
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
 const DASHBOARD_MARKER = "<!-- tms-dashboard -->";
+const PW_PANEL_VIEW_TYPE = "tms-playwright-panel";
+const STATS_SECTION_RE = /\n+---\n+## Test Results Statistics[\s\S]*$/;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -327,7 +332,7 @@ function calculateResults(content: string): string {
     .map((s) => `    "${STATUS_EMOJI[s.key]} ${s.label} (${counts[s.key]})" : ${counts[s.key]}`)
     .join("\n");
 
-  let cleaned = content.replace(/\n+---\n+## Test Results Statistics[\s\S]*$/, "");
+  let cleaned = content.replace(STATS_SECTION_RE, "");
   cleaned = cleaned.replace(/\s+$/, "");
 
   return cleaned + `\n\n---\n\n## Test Results Statistics\n\n\`\`\`mermaid\npie title Test Results (Total: ${total})\n${entries}\n\`\`\`\n`;
@@ -397,45 +402,49 @@ function applyPlaywrightResults(content: string, resultMap: Map<string, string>)
   return { updated, count };
 }
 
-// ─── Playwright Progress Modal ───────────────────────────────────────────────
+// ─── Playwright Panel View ───────────────────────────────────────────────────
 
-class PlaywrightProgressModal extends Modal {
+class PlaywrightPanelView extends ItemView {
   private statusEl!: HTMLElement;
   private outputEl!: HTMLPreElement;
-  private closeBtn!: HTMLButtonElement;
   private intervalId: number | null = null;
   private startTime = Date.now();
 
-  constructor(app: App, private ids: string[], private command: string) {
-    super(app);
+  constructor(leaf: WorkspaceLeaf) {
+    super(leaf);
   }
 
-  onOpen() {
-    this.modalEl.addClass("qa-large-modal");
+  getViewType() { return PW_PANEL_VIEW_TYPE; }
+  getDisplayText() { return "Playwright Tests"; }
+  getIcon() { return "test-tube"; }
+
+  async onOpen() {
+    this.render();
+  }
+
+  render() {
     const { contentEl } = this;
     contentEl.empty();
-
-    contentEl.createEl("h2", { text: "Running Playwright Tests" });
-    contentEl.createEl("p", { text: `IDs: ${this.ids.join(", ")}` });
-
-    const cmdEl = contentEl.createEl("code", { text: this.command, cls: "qa-pw-command" });
-    cmdEl.style.display = "block";
-    cmdEl.style.margin = "8px 0 12px";
-    cmdEl.style.padding = "6px 10px";
-    cmdEl.style.background = "var(--background-secondary)";
-    cmdEl.style.borderRadius = "4px";
-    cmdEl.style.wordBreak = "break-all";
-    cmdEl.style.fontSize = "12px";
-
-    this.statusEl = contentEl.createEl("p", { text: "Running... 0s", cls: "qa-pw-status" });
-
+    contentEl.addClass("qa-pw-panel");
+    contentEl.createEl("h4", { text: "Playwright Tests", cls: "qa-pw-panel-title" });
+    this.statusEl = contentEl.createEl("p", { text: "Ready", cls: "qa-pw-status" });
     this.outputEl = contentEl.createEl("pre", { cls: "qa-pw-output" });
+    this.outputEl.style.flex = "1";
+    this.outputEl.style.overflow = "auto";
+  }
 
-    this.closeBtn = contentEl.createEl("button", { text: "Close" });
-    this.closeBtn.disabled = true;
-    this.closeBtn.style.marginTop = "12px";
-    this.closeBtn.addEventListener("click", () => this.close());
-
+  startRun(ids: string[], command: string) {
+    this.render();
+    this.startTime = Date.now();
+    const idsEl = this.contentEl.createEl("p", { cls: "qa-pw-ids" });
+    idsEl.textContent = `IDs: ${ids.join(", ")}`;
+    this.contentEl.insertBefore(idsEl, this.statusEl);
+    const cmdEl = this.contentEl.createEl("code", { text: command, cls: "qa-pw-command" });
+    cmdEl.style.cssText = "display:block;margin:4px 0 8px;padding:4px 8px;background:var(--background-secondary);border-radius:4px;word-break:break-all;font-size:11px;";
+    this.contentEl.insertBefore(cmdEl, this.statusEl);
+    this.statusEl.textContent = "Running... 0s";
+    this.statusEl.style.color = "";
+    if (this.intervalId !== null) window.clearInterval(this.intervalId);
     this.intervalId = window.setInterval(() => {
       const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
       if (this.statusEl.textContent?.startsWith("Running")) {
@@ -453,10 +462,9 @@ class PlaywrightProgressModal extends Modal {
     if (this.intervalId !== null) { window.clearInterval(this.intervalId); this.intervalId = null; }
     this.statusEl.textContent = message;
     this.statusEl.style.color = success ? "var(--color-green)" : "var(--color-red)";
-    this.closeBtn.disabled = false;
   }
 
-  onClose() {
+  async onClose() {
     if (this.intervalId !== null) window.clearInterval(this.intervalId);
     this.contentEl.empty();
   }
@@ -645,8 +653,15 @@ class TestReviewModal extends Modal {
 
     const renderTree = (items: TestCase[], container: HTMLElement, isCheckable: boolean, childDepth: number, parentHeadingLevel: number = 0) => {
       items.forEach((tc: TestCase) => {
+        if (tc.isHeading && tc.name === "__manually_added_separator__") {
+          const sep = container.createDiv({ cls: "qa-review-separator" });
+          sep.style.cssText = "border-top:1px dashed var(--color-base-40);margin:12px 0 8px;padding-top:8px;";
+          sep.createEl("span", { text: "Added manually", cls: "qa-review-separator-label" }).style.cssText = "font-size:11px;color:var(--color-base-50);text-transform:uppercase;letter-spacing:.05em;padding-left:10px;";
+          return;
+        }
         if (tc.isHeading) {
           const headingEl = container.createDiv({ cls: "qa-review-section-heading" });
+          if (tc.isManuallyAdded) headingEl.style.borderLeftColor = "var(--color-orange)";
           headingEl.style.paddingLeft = `${(tc.headingLevel! - 1) * 20 + 10}px`;
           const leafLineNumbers = collectLeafLineNumbers(tc.children);
           if (leafLineNumbers.length > 0) {
@@ -870,9 +885,7 @@ class AttributeSuggest extends EditorSuggest<string> {
   }
 
   private async buildIndex() {
-    for (const file of this.app.vault.getMarkdownFiles()) {
-      await this.updateFile(file);
-    }
+    await Promise.all(this.app.vault.getMarkdownFiles().map(file => this.updateFile(file)));
   }
 
   private async updateFile(file: TFile) {
@@ -963,6 +976,8 @@ export default class TMSPlugin extends Plugin {
       this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
     }
     await this.ensureStatusPropertyType();
+
+    this.registerView(PW_PANEL_VIEW_TYPE, (leaf) => new PlaywrightPanelView(leaf));
 
     this.addCommand({
       id: "generate-test-run-current",
@@ -1140,7 +1155,17 @@ export default class TMSPlugin extends Plugin {
 
   // ─── Playwright: run automated tests ──────────────────────────────────────
 
-  private runPlaywrightTests(runFile: TFile, ids: string[]) {
+  private async getPlaywrightPanel(): Promise<PlaywrightPanelView> {
+    const existing = this.app.workspace.getLeavesOfType(PW_PANEL_VIEW_TYPE);
+    if (existing.length > 0) return existing[0].view as PlaywrightPanelView;
+    const leaf = this.app.workspace.getRightLeaf(false);
+    if (!leaf) throw new Error("Could not get a workspace leaf for Playwright panel.");
+    await leaf.setViewState({ type: PW_PANEL_VIEW_TYPE, active: true });
+    this.app.workspace.revealLeaf(leaf);
+    return leaf.view as PlaywrightPanelView;
+  }
+
+  private async runPlaywrightTests(runFile: TFile, ids: string[]) {
     const projectPath = this.settings.playwrightProjectPath.trim();
     const baseCommand = this.settings.playwrightCommand.trim() || "npx playwright test";
 
@@ -1157,10 +1182,10 @@ export default class TMSPlugin extends Plugin {
     const tmpResults = path.join(os.tmpdir(), `tms-pw-${Date.now()}.json`);
     const displayCmd = `${baseCommand} --grep "${ids.map(id => `(${id})`).join("|")}" --reporter=list`;
 
-    const modal = new PlaywrightProgressModal(this.app, ids, displayCmd);
-    modal.open();
+    const panel = await this.getPlaywrightPanel();
+    panel.startRun(ids, displayCmd);
 
-    // list → real-time progress in modal; json → written to file via env var
+    // list → real-time progress in panel; json → written to file via env var
     const fullCmd = `${baseCommand} --grep "${grep}" --reporter=list,json`;
 
     const proc = spawn("/bin/zsh", ["-l", "-c", fullCmd], {
@@ -1168,8 +1193,8 @@ export default class TMSPlugin extends Plugin {
       env: { ...process.env, PLAYWRIGHT_JSON_OUTPUT_NAME: tmpResults },
     });
 
-    proc.stdout?.on("data", (chunk: Buffer) => modal.appendOutput(chunk.toString()));
-    proc.stderr?.on("data", (chunk: Buffer) => modal.appendOutput(chunk.toString()));
+    proc.stdout?.on("data", (chunk: Buffer) => panel.appendOutput(chunk.toString()));
+    proc.stderr?.on("data", (chunk: Buffer) => panel.appendOutput(chunk.toString()));
 
     proc.on("close", async (code: number | null) => {
       try {
@@ -1185,7 +1210,7 @@ export default class TMSPlugin extends Plugin {
         const failed  = Array.from(resultMap.values()).filter(s => s === "failed").length;
         const skipped = Array.from(resultMap.values()).filter(s => s === "skipped").length;
 
-        modal.setDone(
+        panel.setDone(
           `Done. ${passed} passed, ${failed} failed, ${skipped} skipped. ${count} test(s) updated.`,
           code === 0
         );
@@ -1193,16 +1218,16 @@ export default class TMSPlugin extends Plugin {
 
         if (count > 0) await this.calculateTestResults(runFile);
       } catch (err) {
-        modal.appendOutput(`\nFailed to parse results: ${(err as Error).message}\n`);
-        modal.setDone("Error parsing Playwright results. Check output above.", false);
+        panel.appendOutput(`\nFailed to parse results: ${(err as Error).message}\n`);
+        panel.setDone("Error parsing Playwright results. Check output above.", false);
       } finally {
         try { fs.unlinkSync(tmpResults); } catch { /* ignore */ }
       }
     });
 
     proc.on("error", (err: Error) => {
-      modal.appendOutput(`\nFailed to start process: ${err.message}\n`);
-      modal.setDone("Failed to run Playwright. Check project path in settings.", false);
+      panel.appendOutput(`\nFailed to start process: ${err.message}\n`);
+      panel.setDone("Failed to run Playwright. Check project path in settings.", false);
     });
   }
 
@@ -1213,13 +1238,27 @@ export default class TMSPlugin extends Plugin {
     return base ? `${base}/${suiteName} Test Runs` : `${suiteName} Test Runs`;
   }
 
+  private getFolderPath(filePath: string): string {
+    return filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
+  }
+
+  private countTestStatuses(content: string): Record<string, number> {
+    const counts: Record<string, number> = { pass: 0, fail: 0, skipped: 0, blocked: 0, notrun: 0 };
+    content.split("\n").forEach((line) => {
+      const trimmed = line.trim();
+      for (const s of STATUS_PATTERNS) {
+        if (s.regex.test(trimmed)) { counts[s.key]++; break; }
+      }
+    });
+    return counts;
+  }
+
   private getBugFilePath(bugName: string, sourceFilePath: string): string {
     const configured = this.settings.bugsFolder.trim().replace(/\/+$/, "");
     if (configured) return `${configured}/${bugName}.md`;
-    const folder = sourceFilePath.includes("/")
-      ? sourceFilePath.substring(0, sourceFilePath.lastIndexOf("/"))
-      : "";
-    return folder ? `${folder}/${bugName}.md` : `${bugName}.md`;
+    return this.getFolderPath(sourceFilePath)
+      ? `${this.getFolderPath(sourceFilePath)}/${bugName}.md`
+      : `${bugName}.md`;
   }
 
   private async ensureFolder(path: string) {
@@ -1245,7 +1284,7 @@ export default class TMSPlugin extends Plugin {
   async createBugFile(bugName: string, sourceFilePath: string): Promise<void> {
     const filePath = this.getBugFilePath(bugName, sourceFilePath);
     if (this.app.vault.getAbstractFileByPath(filePath)) return;
-    const folder = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
+    const folder = this.getFolderPath(filePath);
     if (folder) await this.ensureFolder(folder);
     const title = bugName.replace(/^Bug - /, "");
     await this.app.vault.create(filePath, this.bugTemplate(title));
@@ -1283,6 +1322,8 @@ export default class TMSPlugin extends Plugin {
     // If opened from a test run file — find the original suite and pre-select existing cases
     let suiteFile = file;
     let preselectedNames: Set<string> | null = null;
+    let runCasesAll: TestCase[] = [];
+    let runTree: TestCase[] = [];
 
     if (file.parent?.name.endsWith(" Test Runs")) {
       const suiteName = file.parent.name.replace(/ Test Runs$/, "");
@@ -1295,21 +1336,81 @@ export default class TMSPlugin extends Plugin {
       }
       suiteFile = found;
 
-      // Collect test case names from the current test run for pre-selection
+      // Parse the run body (strip header and stats section)
       const runContent = await this.app.vault.read(file);
-      const runCases = parseTestCases(runContent);
-      preselectedNames = new Set<string>();
-      const collectNames = (items: TestCase[]) => {
+      const runBody = runContent
+        .replace(/^[\s\S]*?(?=\n- \[)/, "")
+        .replace(STATS_SECTION_RE, "");
+      runTree = parseTestCases(runBody);
+
+      // Collect only actual checklist items
+      const flattenLeaves = (items: TestCase[], result: TestCase[]) => {
         for (const tc of items) {
-          if (!tc.isHeading) preselectedNames!.add(tc.name.trim());
-          collectNames(tc.children);
+          if (!tc.isHeading && tc.line.trim().match(/^-\s*\[/)) result.push(tc);
+          flattenLeaves(tc.children, result);
         }
       };
-      collectNames(runCases);
+      flattenLeaves(runTree, runCasesAll);
+
+      preselectedNames = new Set<string>();
+      for (const tc of runCasesAll) preselectedNames.add(tc.name.trim());
     }
 
     const content = await this.app.vault.read(suiteFile);
-    const testCases = parseTestCases(content);
+    let testCases = parseTestCases(content);
+
+    // If opening from a run, find extras (cases in the run not in the suite) and append them
+    if (preselectedNames && runCasesAll.length > 0) {
+      const suiteNames = new Set<string>();
+      const collectSuiteNames = (items: TestCase[]) => {
+        for (const tc of items) {
+          if (!tc.isHeading) suiteNames.add(tc.name.trim());
+          collectSuiteNames(tc.children);
+        }
+      };
+      collectSuiteNames(testCases);
+
+      let extraIdx = 90000;
+      const buildExtrasTree = (items: TestCase[]): TestCase[] => {
+        const result: TestCase[] = [];
+        for (const tc of items) {
+          if (tc.isHeading) {
+            const extraChildren = buildExtrasTree(tc.children);
+            if (extraChildren.length > 0) {
+              result.push({ ...tc, children: extraChildren, hasChildren: true, lineNumber: extraIdx++, isManuallyAdded: true });
+            }
+          } else if (!suiteNames.has(tc.name.trim()) && tc.line.trim().match(/^-\s*\[/)) {
+            result.push({ ...tc, lineNumber: extraIdx++, isManuallyAdded: true });
+          }
+        }
+        return result;
+      };
+      const extrasTree = buildExtrasTree(runTree);
+      if (extrasTree.length > 0) {
+        // Add extras' names to preselectedNames
+        const collectExtrasFlat = (items: TestCase[]) => {
+          for (const tc of items) {
+            if (!tc.isHeading) preselectedNames!.add(tc.name.trim());
+            collectExtrasFlat(tc.children);
+          }
+        };
+        collectExtrasFlat(extrasTree);
+
+        const separator: TestCase = {
+          line: "",
+          name: "__manually_added_separator__",
+          tags: [],
+          lineNumber: 89998,
+          indent: 0,
+          children: [],
+          hasChildren: false,
+          isHeading: true,
+          headingLevel: 2,
+          isManuallyAdded: true,
+        };
+        testCases = [...testCases, separator, ...extrasTree];
+      }
+    }
 
     if (testCases.length === 0) {
       new Notice("No test cases found in this file.");
@@ -1342,6 +1443,7 @@ export default class TMSPlugin extends Plugin {
       }
 
       const leaf = this.app.workspace.getLeaf();
+      if (!leaf) { new Notice("Could not open file."); return { runFile, checklist }; }
       await leaf.openFile(runFile);
       new Notice(`Test Run created: ${runPath}`);
 
@@ -1434,7 +1536,7 @@ export default class TMSPlugin extends Plugin {
     }
 
     // Extract bugs only from the main checklist content (before the auto-generated stats section)
-    const preStatsContent = content.replace(/\n+---\n+## Test Results Statistics[\s\S]*$/, "");
+    const preStatsContent = content.replace(STATS_SECTION_RE, "");
     const bugNames = extractBugNames(preStatsContent);
     let newFilesCreated = false;
     for (const bugName of bugNames) {
@@ -1442,7 +1544,7 @@ export default class TMSPlugin extends Plugin {
       const existingFile = this.app.metadataCache.getFirstLinkpathDest(bugName, "");
       if (!existingFile) {
         const filePath = this.getBugFilePath(bugName, file.path);
-        const folder = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
+        const folder = this.getFolderPath(filePath);
         if (folder) await this.ensureFolder(folder);
         await this.app.vault.create(filePath, this.bugTemplate(title));
         new Notice(`Bug created: ${bugName}`);
@@ -1483,7 +1585,9 @@ export default class TMSPlugin extends Plugin {
       const dashPath = `${file.parent.path}/Dashboard.md`;
       const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
       if (dashFile instanceof TFile) {
-        await this.app.workspace.getLeaf().openFile(dashFile);
+        const leaf1 = this.app.workspace.getLeaf();
+        if (!leaf1) { new Notice("Could not open file."); return; }
+        await leaf1.openFile(dashFile);
         return;
       }
     }
@@ -1494,7 +1598,9 @@ export default class TMSPlugin extends Plugin {
     const dashPath = `${runsFolder}/Dashboard.md`;
     const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
     if (dashFile instanceof TFile) {
-      await this.app.workspace.getLeaf().openFile(dashFile);
+      const leaf2 = this.app.workspace.getLeaf();
+      if (!leaf2) { new Notice("Could not open file."); return; }
+      await leaf2.openFile(dashFile);
     } else {
       new Notice("No dashboard found. Create a test run first.");
     }
@@ -1553,13 +1659,7 @@ export default class TMSPlugin extends Plugin {
 
     for (const runFile of runFiles) {
       const content = await this.app.vault.cachedRead(runFile);
-      const counts: Record<string, number> = { pass: 0, fail: 0, skipped: 0, blocked: 0, notrun: 0 };
-      content.split("\n").forEach((line) => {
-        const trimmed = line.trim();
-        for (const s of STATUS_PATTERNS) {
-          if (s.regex.test(trimmed)) { counts[s.key]++; break; }
-        }
-      });
+      const counts = this.countTestStatuses(content);
       const total = (Object.keys(counts) as string[]).reduce((a, k) => a + counts[k], 0);
       runs.push({
         file: runFile,
@@ -1573,7 +1673,7 @@ export default class TMSPlugin extends Plugin {
       });
 
       // Extract bugs only from main checklist content (before auto-generated stats)
-      const preStats = content.replace(/\n+---\n+## Test Results Statistics[\s\S]*$/, "");
+      const preStats = content.replace(STATS_SECTION_RE, "");
       for (const bugName of extractBugNames(preStats)) {
         allBugNames.add(bugName);
       }

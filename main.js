@@ -25,6 +25,8 @@ module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 var DASHBOARD_MARKER = "<!-- tms-dashboard -->";
+var PW_PANEL_VIEW_TYPE = "tms-playwright-panel";
+var STATS_SECTION_RE = /\n+---\n+## Test Results Statistics[\s\S]*$/;
 function parseTestCase(line, lineNumber) {
   var _a;
   const trimmed = line.trim();
@@ -285,7 +287,7 @@ function calculateResults(content) {
   if (total === 0)
     return "";
   const entries = STATUS_PATTERNS.filter((s) => counts[s.key] > 0).map((s) => `    "${STATUS_EMOJI[s.key]} ${s.label} (${counts[s.key]})" : ${counts[s.key]}`).join("\n");
-  let cleaned = content.replace(/\n+---\n+## Test Results Statistics[\s\S]*$/, "");
+  let cleaned = content.replace(STATS_SECTION_RE, "");
   cleaned = cleaned.replace(/\s+$/, "");
   return cleaned + `
 
@@ -365,34 +367,47 @@ function applyPlaywrightResults(content, resultMap) {
   }).join("\n");
   return { updated, count };
 }
-var PlaywrightProgressModal = class extends import_obsidian.Modal {
-  constructor(app, ids, command) {
-    super(app);
-    this.ids = ids;
-    this.command = command;
+var PlaywrightPanelView = class extends import_obsidian.ItemView {
+  constructor(leaf) {
+    super(leaf);
     this.intervalId = null;
     this.startTime = Date.now();
   }
-  onOpen() {
-    this.modalEl.addClass("qa-large-modal");
+  getViewType() {
+    return PW_PANEL_VIEW_TYPE;
+  }
+  getDisplayText() {
+    return "Playwright Tests";
+  }
+  getIcon() {
+    return "test-tube";
+  }
+  async onOpen() {
+    this.render();
+  }
+  render() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Running Playwright Tests" });
-    contentEl.createEl("p", { text: `IDs: ${this.ids.join(", ")}` });
-    const cmdEl = contentEl.createEl("code", { text: this.command, cls: "qa-pw-command" });
-    cmdEl.style.display = "block";
-    cmdEl.style.margin = "8px 0 12px";
-    cmdEl.style.padding = "6px 10px";
-    cmdEl.style.background = "var(--background-secondary)";
-    cmdEl.style.borderRadius = "4px";
-    cmdEl.style.wordBreak = "break-all";
-    cmdEl.style.fontSize = "12px";
-    this.statusEl = contentEl.createEl("p", { text: "Running... 0s", cls: "qa-pw-status" });
+    contentEl.addClass("qa-pw-panel");
+    contentEl.createEl("h4", { text: "Playwright Tests", cls: "qa-pw-panel-title" });
+    this.statusEl = contentEl.createEl("p", { text: "Ready", cls: "qa-pw-status" });
     this.outputEl = contentEl.createEl("pre", { cls: "qa-pw-output" });
-    this.closeBtn = contentEl.createEl("button", { text: "Close" });
-    this.closeBtn.disabled = true;
-    this.closeBtn.style.marginTop = "12px";
-    this.closeBtn.addEventListener("click", () => this.close());
+    this.outputEl.style.flex = "1";
+    this.outputEl.style.overflow = "auto";
+  }
+  startRun(ids, command) {
+    this.render();
+    this.startTime = Date.now();
+    const idsEl = this.contentEl.createEl("p", { cls: "qa-pw-ids" });
+    idsEl.textContent = `IDs: ${ids.join(", ")}`;
+    this.contentEl.insertBefore(idsEl, this.statusEl);
+    const cmdEl = this.contentEl.createEl("code", { text: command, cls: "qa-pw-command" });
+    cmdEl.style.cssText = "display:block;margin:4px 0 8px;padding:4px 8px;background:var(--background-secondary);border-radius:4px;word-break:break-all;font-size:11px;";
+    this.contentEl.insertBefore(cmdEl, this.statusEl);
+    this.statusEl.textContent = "Running... 0s";
+    this.statusEl.style.color = "";
+    if (this.intervalId !== null)
+      window.clearInterval(this.intervalId);
     this.intervalId = window.setInterval(() => {
       var _a;
       const elapsed = Math.floor((Date.now() - this.startTime) / 1e3);
@@ -412,9 +427,8 @@ var PlaywrightProgressModal = class extends import_obsidian.Modal {
     }
     this.statusEl.textContent = message;
     this.statusEl.style.color = success ? "var(--color-green)" : "var(--color-red)";
-    this.closeBtn.disabled = false;
   }
-  onClose() {
+  async onClose() {
     if (this.intervalId !== null)
       window.clearInterval(this.intervalId);
     this.contentEl.empty();
@@ -573,8 +587,16 @@ var TestReviewModal = class extends import_obsidian.Modal {
     this.checkboxRefs = [];
     const renderTree = (items, container, isCheckable, childDepth, parentHeadingLevel = 0) => {
       items.forEach((tc) => {
+        if (tc.isHeading && tc.name === "__manually_added_separator__") {
+          const sep = container.createDiv({ cls: "qa-review-separator" });
+          sep.style.cssText = "border-top:1px dashed var(--color-base-40);margin:12px 0 8px;padding-top:8px;";
+          sep.createEl("span", { text: "Added manually", cls: "qa-review-separator-label" }).style.cssText = "font-size:11px;color:var(--color-base-50);text-transform:uppercase;letter-spacing:.05em;padding-left:10px;";
+          return;
+        }
         if (tc.isHeading) {
           const headingEl = container.createDiv({ cls: "qa-review-section-heading" });
+          if (tc.isManuallyAdded)
+            headingEl.style.borderLeftColor = "var(--color-orange)";
           headingEl.style.paddingLeft = `${(tc.headingLevel - 1) * 20 + 10}px`;
           const leafLineNumbers = collectLeafLineNumbers(tc.children);
           if (leafLineNumbers.length > 0) {
@@ -788,9 +810,7 @@ var AttributeSuggest = class extends import_obsidian.EditorSuggest {
     );
   }
   async buildIndex() {
-    for (const file of this.app.vault.getMarkdownFiles()) {
-      await this.updateFile(file);
-    }
+    await Promise.all(this.app.vault.getMarkdownFiles().map((file) => this.updateFile(file)));
   }
   async updateFile(file) {
     const content = await this.app.vault.cachedRead(file);
@@ -856,6 +876,7 @@ var TMSPlugin = class extends import_obsidian.Plugin {
       this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
     }
     await this.ensureStatusPropertyType();
+    this.registerView(PW_PANEL_VIEW_TYPE, (leaf) => new PlaywrightPanelView(leaf));
     this.addCommand({
       id: "generate-test-run-current",
       name: "Test Run",
@@ -1024,7 +1045,18 @@ var TMSPlugin = class extends import_obsidian.Plugin {
     toggle(this.statusBarDashboard, this.settings.showStatusBarDashboard && this.settings.enableDashboard);
   }
   // ─── Playwright: run automated tests ──────────────────────────────────────
-  runPlaywrightTests(runFile, ids) {
+  async getPlaywrightPanel() {
+    const existing = this.app.workspace.getLeavesOfType(PW_PANEL_VIEW_TYPE);
+    if (existing.length > 0)
+      return existing[0].view;
+    const leaf = this.app.workspace.getRightLeaf(false);
+    if (!leaf)
+      throw new Error("Could not get a workspace leaf for Playwright panel.");
+    await leaf.setViewState({ type: PW_PANEL_VIEW_TYPE, active: true });
+    this.app.workspace.revealLeaf(leaf);
+    return leaf.view;
+  }
+  async runPlaywrightTests(runFile, ids) {
     var _a, _b;
     const projectPath = this.settings.playwrightProjectPath.trim();
     const baseCommand = this.settings.playwrightCommand.trim() || "npx playwright test";
@@ -1035,15 +1067,15 @@ var TMSPlugin = class extends import_obsidian.Plugin {
     const grep = ids.map((id) => `\\(${id}\\)`).join("|");
     const tmpResults = path.join(os.tmpdir(), `tms-pw-${Date.now()}.json`);
     const displayCmd = `${baseCommand} --grep "${ids.map((id) => `(${id})`).join("|")}" --reporter=list`;
-    const modal = new PlaywrightProgressModal(this.app, ids, displayCmd);
-    modal.open();
+    const panel = await this.getPlaywrightPanel();
+    panel.startRun(ids, displayCmd);
     const fullCmd = `${baseCommand} --grep "${grep}" --reporter=list,json`;
     const proc = spawn("/bin/zsh", ["-l", "-c", fullCmd], {
       cwd: projectPath,
       env: { ...process.env, PLAYWRIGHT_JSON_OUTPUT_NAME: tmpResults }
     });
-    (_a = proc.stdout) == null ? void 0 : _a.on("data", (chunk) => modal.appendOutput(chunk.toString()));
-    (_b = proc.stderr) == null ? void 0 : _b.on("data", (chunk) => modal.appendOutput(chunk.toString()));
+    (_a = proc.stdout) == null ? void 0 : _a.on("data", (chunk) => panel.appendOutput(chunk.toString()));
+    (_b = proc.stderr) == null ? void 0 : _b.on("data", (chunk) => panel.appendOutput(chunk.toString()));
     proc.on("close", async (code) => {
       try {
         const jsonContent = fs.readFileSync(tmpResults, "utf-8");
@@ -1056,7 +1088,7 @@ var TMSPlugin = class extends import_obsidian.Plugin {
         const passed = Array.from(resultMap.values()).filter((s) => s === "passed").length;
         const failed = Array.from(resultMap.values()).filter((s) => s === "failed").length;
         const skipped = Array.from(resultMap.values()).filter((s) => s === "skipped").length;
-        modal.setDone(
+        panel.setDone(
           `Done. ${passed} passed, ${failed} failed, ${skipped} skipped. ${count} test(s) updated.`,
           code === 0
         );
@@ -1064,10 +1096,10 @@ var TMSPlugin = class extends import_obsidian.Plugin {
         if (count > 0)
           await this.calculateTestResults(runFile);
       } catch (err) {
-        modal.appendOutput(`
+        panel.appendOutput(`
 Failed to parse results: ${err.message}
 `);
-        modal.setDone("Error parsing Playwright results. Check output above.", false);
+        panel.setDone("Error parsing Playwright results. Check output above.", false);
       } finally {
         try {
           fs.unlinkSync(tmpResults);
@@ -1076,10 +1108,10 @@ Failed to parse results: ${err.message}
       }
     });
     proc.on("error", (err) => {
-      modal.appendOutput(`
+      panel.appendOutput(`
 Failed to start process: ${err.message}
 `);
-      modal.setDone("Failed to run Playwright. Check project path in settings.", false);
+      panel.setDone("Failed to run Playwright. Check project path in settings.", false);
     });
   }
   // ─── Folder helpers ────────────────────────────────────────────────────────
@@ -1087,12 +1119,27 @@ Failed to start process: ${err.message}
     const base = this.settings.defaultTestRunFolder.trim().replace(/\/+$/, "");
     return base ? `${base}/${suiteName} Test Runs` : `${suiteName} Test Runs`;
   }
+  getFolderPath(filePath) {
+    return filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
+  }
+  countTestStatuses(content) {
+    const counts = { pass: 0, fail: 0, skipped: 0, blocked: 0, notrun: 0 };
+    content.split("\n").forEach((line) => {
+      const trimmed = line.trim();
+      for (const s of STATUS_PATTERNS) {
+        if (s.regex.test(trimmed)) {
+          counts[s.key]++;
+          break;
+        }
+      }
+    });
+    return counts;
+  }
   getBugFilePath(bugName, sourceFilePath) {
     const configured = this.settings.bugsFolder.trim().replace(/\/+$/, "");
     if (configured)
       return `${configured}/${bugName}.md`;
-    const folder = sourceFilePath.includes("/") ? sourceFilePath.substring(0, sourceFilePath.lastIndexOf("/")) : "";
-    return folder ? `${folder}/${bugName}.md` : `${bugName}.md`;
+    return this.getFolderPath(sourceFilePath) ? `${this.getFolderPath(sourceFilePath)}/${bugName}.md` : `${bugName}.md`;
   }
   async ensureFolder(path) {
     if (!path)
@@ -1117,7 +1164,7 @@ Failed to start process: ${err.message}
     const filePath = this.getBugFilePath(bugName, sourceFilePath);
     if (this.app.vault.getAbstractFileByPath(filePath))
       return;
-    const folder = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
+    const folder = this.getFolderPath(filePath);
     if (folder)
       await this.ensureFolder(folder);
     const title = bugName.replace(/^Bug - /, "");
@@ -1157,6 +1204,8 @@ Failed to start process: ${err.message}
     var _a;
     let suiteFile = file;
     let preselectedNames = null;
+    let runCasesAll = [];
+    let runTree = [];
     if ((_a = file.parent) == null ? void 0 : _a.name.endsWith(" Test Runs")) {
       const suiteName2 = file.parent.name.replace(/ Test Runs$/, "");
       const found = this.app.vault.getFiles().find(
@@ -1168,19 +1217,72 @@ Failed to start process: ${err.message}
       }
       suiteFile = found;
       const runContent = await this.app.vault.read(file);
-      const runCases = parseTestCases(runContent);
-      preselectedNames = /* @__PURE__ */ new Set();
-      const collectNames = (items) => {
+      const runBody = runContent.replace(/^[\s\S]*?(?=\n- \[)/, "").replace(STATS_SECTION_RE, "");
+      runTree = parseTestCases(runBody);
+      const flattenLeaves = (items, result) => {
         for (const tc of items) {
-          if (!tc.isHeading)
-            preselectedNames.add(tc.name.trim());
-          collectNames(tc.children);
+          if (!tc.isHeading && tc.line.trim().match(/^-\s*\[/))
+            result.push(tc);
+          flattenLeaves(tc.children, result);
         }
       };
-      collectNames(runCases);
+      flattenLeaves(runTree, runCasesAll);
+      preselectedNames = /* @__PURE__ */ new Set();
+      for (const tc of runCasesAll)
+        preselectedNames.add(tc.name.trim());
     }
     const content = await this.app.vault.read(suiteFile);
-    const testCases = parseTestCases(content);
+    let testCases = parseTestCases(content);
+    if (preselectedNames && runCasesAll.length > 0) {
+      const suiteNames = /* @__PURE__ */ new Set();
+      const collectSuiteNames = (items) => {
+        for (const tc of items) {
+          if (!tc.isHeading)
+            suiteNames.add(tc.name.trim());
+          collectSuiteNames(tc.children);
+        }
+      };
+      collectSuiteNames(testCases);
+      let extraIdx = 9e4;
+      const buildExtrasTree = (items) => {
+        const result = [];
+        for (const tc of items) {
+          if (tc.isHeading) {
+            const extraChildren = buildExtrasTree(tc.children);
+            if (extraChildren.length > 0) {
+              result.push({ ...tc, children: extraChildren, hasChildren: true, lineNumber: extraIdx++, isManuallyAdded: true });
+            }
+          } else if (!suiteNames.has(tc.name.trim()) && tc.line.trim().match(/^-\s*\[/)) {
+            result.push({ ...tc, lineNumber: extraIdx++, isManuallyAdded: true });
+          }
+        }
+        return result;
+      };
+      const extrasTree = buildExtrasTree(runTree);
+      if (extrasTree.length > 0) {
+        const collectExtrasFlat = (items) => {
+          for (const tc of items) {
+            if (!tc.isHeading)
+              preselectedNames.add(tc.name.trim());
+            collectExtrasFlat(tc.children);
+          }
+        };
+        collectExtrasFlat(extrasTree);
+        const separator = {
+          line: "",
+          name: "__manually_added_separator__",
+          tags: [],
+          lineNumber: 89998,
+          indent: 0,
+          children: [],
+          hasChildren: false,
+          isHeading: true,
+          headingLevel: 2,
+          isManuallyAdded: true
+        };
+        testCases = [...testCases, separator, ...extrasTree];
+      }
+    }
     if (testCases.length === 0) {
       new import_obsidian.Notice("No test cases found in this file.");
       return;
@@ -1206,6 +1308,10 @@ Failed to start process: ${err.message}
           await this.regenerateDashboard(dashFile);
       }
       const leaf = this.app.workspace.getLeaf();
+      if (!leaf) {
+        new import_obsidian.Notice("Could not open file.");
+        return { runFile, checklist };
+      }
       await leaf.openFile(runFile);
       new import_obsidian.Notice(`Test Run created: ${runPath}`);
       return { runFile, checklist };
@@ -1282,7 +1388,7 @@ Failed to start process: ${err.message}
       new import_obsidian.Notice("No checklist items found in this file.");
       return;
     }
-    const preStatsContent = content.replace(/\n+---\n+## Test Results Statistics[\s\S]*$/, "");
+    const preStatsContent = content.replace(STATS_SECTION_RE, "");
     const bugNames = extractBugNames(preStatsContent);
     let newFilesCreated = false;
     for (const bugName of bugNames) {
@@ -1290,7 +1396,7 @@ Failed to start process: ${err.message}
       const existingFile = this.app.metadataCache.getFirstLinkpathDest(bugName, "");
       if (!existingFile) {
         const filePath = this.getBugFilePath(bugName, file.path);
-        const folder = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
+        const folder = this.getFolderPath(filePath);
         if (folder)
           await this.ensureFolder(folder);
         await this.app.vault.create(filePath, this.bugTemplate(title));
@@ -1343,7 +1449,12 @@ ${rows.join("\n")}
       const dashPath2 = `${file.parent.path}/Dashboard.md`;
       const dashFile2 = this.app.vault.getAbstractFileByPath(dashPath2);
       if (dashFile2 instanceof import_obsidian.TFile) {
-        await this.app.workspace.getLeaf().openFile(dashFile2);
+        const leaf1 = this.app.workspace.getLeaf();
+        if (!leaf1) {
+          new import_obsidian.Notice("Could not open file.");
+          return;
+        }
+        await leaf1.openFile(dashFile2);
         return;
       }
     }
@@ -1352,7 +1463,12 @@ ${rows.join("\n")}
     const dashPath = `${runsFolder}/Dashboard.md`;
     const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
     if (dashFile instanceof import_obsidian.TFile) {
-      await this.app.workspace.getLeaf().openFile(dashFile);
+      const leaf2 = this.app.workspace.getLeaf();
+      if (!leaf2) {
+        new import_obsidian.Notice("Could not open file.");
+        return;
+      }
+      await leaf2.openFile(dashFile);
     } else {
       new import_obsidian.Notice("No dashboard found. Create a test run first.");
     }
@@ -1395,16 +1511,7 @@ ${rows.join("\n")}
     const allBugNames = /* @__PURE__ */ new Set();
     for (const runFile of runFiles) {
       const content = await this.app.vault.cachedRead(runFile);
-      const counts = { pass: 0, fail: 0, skipped: 0, blocked: 0, notrun: 0 };
-      content.split("\n").forEach((line) => {
-        const trimmed = line.trim();
-        for (const s of STATUS_PATTERNS) {
-          if (s.regex.test(trimmed)) {
-            counts[s.key]++;
-            break;
-          }
-        }
-      });
+      const counts = this.countTestStatuses(content);
       const total = Object.keys(counts).reduce((a, k) => a + counts[k], 0);
       runs.push({
         file: runFile,
@@ -1416,7 +1523,7 @@ ${rows.join("\n")}
         notrun: counts.notrun,
         total
       });
-      const preStats = content.replace(/\n+---\n+## Test Results Statistics[\s\S]*$/, "");
+      const preStats = content.replace(STATS_SECTION_RE, "");
       for (const bugName of extractBugNames(preStats)) {
         allBugNames.add(bugName);
       }
