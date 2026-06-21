@@ -10,10 +10,14 @@ An Obsidian plugin for managing test cases: creating test plans, filtering by at
 2. [Attributes @](#2-attributes-)
 3. [Attribute Autocomplete](#3-attribute-autocomplete)
 4. [Generating a Test Run](#4-generating-a-test-run)
-5. [Running Tests](#5-running-tests)
-6. [Calculating Results](#6-calculating-results)
-7. [Settings](#7-settings)
-8. [Commands and Buttons](#8-commands-and-buttons)
+5. [Re-running from an Existing Test Run](#5-re-running-from-an-existing-test-run)
+6. [Running Tests](#6-running-tests)
+7. [Calculating Results](#7-calculating-results)
+8. [Bugs](#8-bugs)
+9. [Dashboard](#9-dashboard)
+10. [Playwright Integration](#10-playwright-integration)
+11. [Settings](#11-settings)
+12. [Commands and Buttons](#12-commands-and-buttons)
 
 ---
 
@@ -168,7 +172,24 @@ File structure:
 
 ---
 
-## 5. Running Tests
+## 5. Re-running from an Existing Test Run
+
+You can start a new test run directly from an existing test run file — no need to go back to the test suite.
+
+**How:** open any test run file and press **Test Run** (command palette, ribbon, or status bar).
+
+The plugin will:
+1. Detect that the current file is a test run (it's inside a `* Test Runs` folder)
+2. Find the original test suite automatically
+3. Open the Review modal with the **same test cases pre-selected** as in the current run
+
+You can then add or remove cases before generating the new run.
+
+> If the original suite file cannot be found, a notice will appear asking you to open it directly.
+
+---
+
+## 6. Running Tests
 
 In the generated test run, replace `[ ]` with the case status:
 
@@ -191,34 +212,177 @@ The label (`✅ Pass |`, `❌ Fail |`, etc.) is **added automatically** when the
 
 ---
 
-## 6. Calculating Results
+## 7. Calculating Results
 
-Open a test run and run the **Results** command. A summary table is appended at the end of the file:
+Open a test run and run the **Results** command. A summary chart is appended at the end of the file.
 
-```markdown
-## Test Results Statistics
-
-| Status | Count | % |
-| --- | --- | --- |
-| ✅ Pass | 8 | 61.5% |
-| ❌ Fail | 3 | 23.1% |
-| ⏭️ Skipped | 2 | 15.4% |
-| **Total** | **13** | |
-```
-
-The command can be run multiple times — the table updates in place, no duplicates.
+The command can be run multiple times — the section updates in place, no duplicates.
 
 ---
 
-## 7. Settings
+## 8. Bugs
 
-Open **Settings → Test Manager System**.
+### Creating a bug with `!`
 
-### Test Run Folder
+In any test run file, type `!` at the start of a line (or after `- `). A **Bug** suggestion appears. Select it — the line is replaced with `[[Bug - ]]` and your cursor is placed inside so you can type the name.
 
-Set the folder where generated test runs are saved. Leave empty to save in the vault root.
+```
+- [f] ❌ Fail | Login test
+  [[Bug - Login button is broken]]
+```
 
-Type the path manually or click **Browse…** to pick a folder.
+When you run the **Results** command, the plugin:
+- Scans for all `[[Bug - ...]]` links in the checklist
+- Creates a bug file for each one that doesn't exist yet
+- Appends a **Bugs** table at the end of the results
+
+### Bug table
+
+The Bugs table appears in the results only when bugs are referenced:
+
+- If **at least one bug has a status** set in its frontmatter → table shows with a Status column
+- If **no bugs have a status** → table shows with only the Bug column (no Status column)
+
+### Bug template
+
+Set a template for new bug files in **Settings → Bug template**. Use `{{title}}` as a placeholder for the bug name:
+
+```
+---
+status: New
+tags: [Bug]
+---
+
+# {{title}}
+
+## Description
+
+## Steps to Reproduce
+```
+
+When a bug file is created (via `!`, clicking an unresolved link, or the Results command), the template is applied automatically.
+
+### Insert Bug Template command
+
+To apply the bug template to any open file manually:
+
+`Cmd/Ctrl+P` → **Test Manager: Insert Bug Template**
+
+The template is inserted at the cursor position. If the file is named `Bug - Something`, `{{title}}` is replaced with `Something`.
+
+> If no template is configured, a notice appears with a link to settings.
+
+### Bugs folder
+
+Set a dedicated folder for bug files in **Settings → Bugs folder**. When a bug file is created, it is automatically moved there regardless of where the link was clicked.
+
+---
+
+## 9. Dashboard
+
+The Dashboard is a summary page that auto-generates inside the test runs folder.
+
+### What it contains
+
+- **Test Runs table** — all runs for the suite, newest first, with pass/fail/skip/blocked/not-run counts
+- **Bugs table** — all bugs referenced across all runs, with their current status
+
+### Auto-refresh
+
+The Dashboard refreshes automatically every time you open it. You can also refresh it manually via the **Dashboard** command (command palette, ribbon, or status bar).
+
+### Hidden bug statuses
+
+In **Settings → Hidden bug statuses**, enter a comma-separated list of statuses to exclude from the Bugs table (e.g. `done, closed, wontfix`). Default: `done`.
+
+### Enable / disable
+
+The Dashboard can be fully disabled in **Settings → Enable Dashboard**. When disabled, no Dashboard file is created and the Dashboard buttons are hidden.
+
+---
+
+## 10. Playwright Integration
+
+Run automated Playwright tests alongside manual ones in the same test run. Results sync back automatically — manual tests are never touched.
+
+### How it works
+
+The plugin matches test cases by ID: `(T001)` in Obsidian ↔ `(T001)` in the Playwright test title.
+
+When you click **⚡ Run with Automated Tests**, the plugin:
+1. Extracts all `(Txxx)` IDs from the test run
+2. Runs Playwright with a grep filter for those IDs
+3. Shows real-time output in a progress modal
+4. Maps results back into the test run file
+5. Automatically runs **Results** to update the statistics
+
+### Setup — 4 steps
+
+**Step 1.** In your Obsidian test suite, add `(T001)` at the end of each automated test case:
+
+```
+- [ ] Login with valid credentials (T001)
+- [ ] Invalid password (T002)
+- [ ] Check UI on mobile          ← manual, no ID, never modified
+```
+
+**Step 2.** In your Playwright test file, add the same ID to the test **title**:
+
+```ts
+test('Login with valid credentials (T001)', async ({ page }) => {
+  // ...
+});
+
+test('Invalid password (T002)', async ({ page }) => {
+  // ...
+});
+```
+
+**Step 3.** In plugin settings → **Playwright project path** — set the absolute path to the folder containing `playwright.config.ts`:
+
+```
+/Users/you/my-project
+```
+
+**Step 4.** Open your test suite → **Test Run** → in the review window click **⚡ Run with Automated Tests**.
+
+### Result mapping
+
+| Playwright | Obsidian |
+|------------|----------|
+| `passed` | `[p] ✅ Pass` |
+| `failed` | `[f] ❌ Fail` |
+| `skipped` | `[s] ⏭️ Skipped` |
+
+### Example — test run after sync
+
+```
+- [p] ✅ Pass | Login with valid credentials (T001)
+- [f] ❌ Fail | Invalid password (T002)
+- [ ] Check UI on mobile          ← unchanged
+- [ ] Check email layout          ← unchanged
+```
+
+---
+
+## 11. Settings
+
+Open **Settings → Test Management System**.
+
+### Storage
+
+| Setting | Description |
+|---------|-------------|
+| Base folder for test runs | Folder where `{Suite} Test Runs/` folders are created. Leave empty for vault root. |
+| Bugs folder | Folder where bug files are saved. Leave empty to save next to the test run. |
+| Bug template | Template applied to new bug files. Use `{{title}}` for the bug name. Leave empty for a blank file. |
+
+### Dashboard
+
+| Setting | Description |
+|---------|-------------|
+| Enable Dashboard | Auto-creates and refreshes the Dashboard page in each test runs folder. |
+| Hidden bug statuses | Comma-separated statuses to hide from the Bugs table (e.g. `done, closed`). |
 
 ### Buttons
 
@@ -228,20 +392,27 @@ Each button can be shown or hidden independently:
 |---------|-------------|
 | Ribbon: Test Run | 🧪 icon on the left sidebar |
 | Ribbon: Results | 📊 icon on the left sidebar |
-| Status bar: Test Run | `🧪 Test Run` button in the bottom bar |
-| Status bar: Results | `📊 Results` button in the bottom bar |
+| Ribbon: Dashboard | 📈 icon on the left sidebar |
+| Status bar: Test Run | `🧪 Test Run` in the bottom bar |
+| Status bar: Results | `📊 Results` in the bottom bar |
+| Status bar: Dashboard | `📈 Dashboard` in the bottom bar |
 
-### Hotkeys
+### Playwright Integration
 
-Hotkeys are configured via **Settings → Hotkeys**, search for `Test Manager`.
+| Setting | Description |
+|---------|-------------|
+| Playwright project path | Absolute path to the folder containing `playwright.config.ts` |
+| Run command | Command used to run Playwright. Default: `npx playwright test` |
 
 ---
 
-## 8. Commands and Buttons
+## 12. Commands and Buttons
 
-| Method | Test Run | Results |
-|--------|----------|---------|
-| Command palette (`Cmd/Ctrl+P`) | `Test Manager: Test Run` | `Test Manager: Results` |
-| Ribbon (left sidebar) | 🧪 | 📊 |
-| Status bar (bottom) | `🧪 Test Run` | `📊 Results` |
-| Hotkey | Configurable | Configurable |
+| Command | Palette | Ribbon | Status bar |
+|---------|---------|--------|------------|
+| Test Run | `Test Manager: Test Run` | 🧪 | `🧪 Test Run` |
+| Results | `Test Manager: Results` | 📊 | `📊 Results` |
+| Dashboard | `Test Manager: Dashboard` | 📈 | `📈 Dashboard` |
+| Insert Bug Template | `Test Manager: Insert Bug Template` | — | — |
+
+Hotkeys for all commands can be configured via **Settings → Hotkeys**, search for `Test Manager`.

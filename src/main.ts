@@ -208,6 +208,19 @@ function filterByTags(
   return filtered;
 }
 
+function filterByNames(testCases: TestCase[], names: Set<string>): TestCase[] {
+  const result: TestCase[] = [];
+  for (const tc of testCases) {
+    if (tc.isHeading) {
+      const children = filterByNames(tc.children, names);
+      if (children.length > 0) result.push({ ...tc, children, hasChildren: true });
+    } else if (names.has(tc.name.trim())) {
+      result.push(tc);
+    }
+  }
+  return result;
+}
+
 function generateChecklist(
   testCases: TestCase[],
   suiteName: string,
@@ -321,11 +334,15 @@ function calculateResults(content: string): string {
 }
 
 function extractBugNames(content: string): string[] {
-  const regex = /\[\[Bug - ([^\]|#]+)/g;
   const seen = new Set<string>();
-  let m;
-  while ((m = regex.exec(content)) !== null) {
-    seen.add(`Bug - ${m[1].trim()}`);
+  for (const line of content.split("\n")) {
+    // Strip inline code and bold to avoid matching [[Bug - ...]] in descriptions/examples
+    const stripped = line.replace(/`[^`]+`/g, "").replace(/\*\*[^*]+\*\*/g, "");
+    const regex = /\[\[Bug - ([^\]|#]+)/g;
+    let m;
+    while ((m = regex.exec(stripped)) !== null) {
+      seen.add(`Bug - ${m[1].trim()}`);
+    }
   }
   return Array.from(seen);
 }
@@ -366,10 +383,10 @@ function parsePwJsonReport(report: PwJsonReport): Map<string, string> {
 }
 
 function applyPlaywrightResults(content: string, resultMap: Map<string, string>): { updated: string; count: number } {
-  const charMap: Record<string, string> = { passed: "x", failed: "f", skipped: "s" };
+  const charMap: Record<string, string> = { passed: "p", failed: "f", skipped: "s" };
   let count = 0;
   const updated = content.split("\n").map(line => {
-    const m = line.match(/\(T(\d+)\)\s*$/i);
+    const m = line.match(/\(T(\d+)\)/i);
     if (!m) return line;
     const status = resultMap.get(`T${m[1]}`);
     if (!status || !charMap[status]) return line;
@@ -414,15 +431,16 @@ class PlaywrightProgressModal extends Modal {
 
     this.outputEl = contentEl.createEl("pre", { cls: "qa-pw-output" });
 
-    new Setting(contentEl).addButton(btn => {
-      this.closeBtn = btn.buttonEl;
-      btn.setButtonText("Close").setDisabled(true).onClick(() => this.close());
-    });
+    this.closeBtn = contentEl.createEl("button", { text: "Close" });
+    this.closeBtn.disabled = true;
+    this.closeBtn.style.marginTop = "12px";
+    this.closeBtn.addEventListener("click", () => this.close());
 
     this.intervalId = window.setInterval(() => {
-      if (!this.closeBtn?.disabled) return;
       const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
-      this.statusEl.textContent = `Running... ${elapsed}s`;
+      if (this.statusEl.textContent?.startsWith("Running")) {
+        this.statusEl.textContent = `Running... ${elapsed}s`;
+      }
     }, 1000);
   }
 
@@ -435,7 +453,7 @@ class PlaywrightProgressModal extends Modal {
     if (this.intervalId !== null) { window.clearInterval(this.intervalId); this.intervalId = null; }
     this.statusEl.textContent = message;
     this.statusEl.style.color = success ? "var(--color-green)" : "var(--color-red)";
-    if (this.closeBtn) this.closeBtn.disabled = false;
+    this.closeBtn.disabled = false;
   }
 
   onClose() {
@@ -581,8 +599,9 @@ class TestReviewModal extends Modal {
     filteredTestCases: TestCase[],
     private includeTags: string[],
     private excludeTags: string[],
-    private onConfirm: (selectedCases: TestCase[]) => void,
-    private onBack: () => void
+    private onManual: (selectedCases: TestCase[]) => void,
+    private onBack: () => void,
+    private onAuto: ((selectedCases: TestCase[]) => void) | null = null
   ) {
     super(app);
     const addChecked = (items: TestCase[]) => {
@@ -738,7 +757,20 @@ class TestReviewModal extends Modal {
 
     renderTree(this.allTestCases, listEl, true, 0, 0);
 
-    new Setting(contentEl)
+    const collectSelected = (items: TestCase[]): TestCase[] => {
+      const result: TestCase[] = [];
+      for (const tc of items) {
+        if (tc.isHeading) {
+          const selectedChildren = collectSelected(tc.children);
+          if (selectedChildren.length > 0) result.push({ ...tc, children: selectedChildren, hasChildren: true });
+        } else if (this.checkedItems.has(tc.lineNumber)) {
+          result.push({ ...tc, children: collectSelected(tc.children) });
+        }
+      }
+      return result;
+    };
+
+    const setting = new Setting(contentEl)
       .addButton((btn) =>
         btn.setButtonText("← Back").onClick(() => {
           this.close();
@@ -747,30 +779,33 @@ class TestReviewModal extends Modal {
       )
       .addButton((btn) =>
         btn
-          .setButtonText("Generate Test Run")
-          .setCta()
+          .setButtonText("Manual Test Run")
           .onClick(() => {
-            const collectSelected = (items: TestCase[]): TestCase[] => {
-              const result: TestCase[] = [];
-              for (const tc of items) {
-                if (tc.isHeading) {
-                  const selectedChildren = collectSelected(tc.children);
-                  if (selectedChildren.length > 0) result.push({ ...tc, children: selectedChildren, hasChildren: true });
-                } else if (this.checkedItems.has(tc.lineNumber)) {
-                  result.push({ ...tc, children: collectSelected(tc.children) });
-                }
-              }
-              return result;
-            };
             const selected = collectSelected(this.allTestCases);
             if (countLeafTestCases(selected) === 0) {
               new Notice("No test cases selected.");
               return;
             }
-            this.onConfirm(selected);
+            this.onManual(selected);
             this.close();
           })
       );
+
+    if (this.onAuto !== null) {
+      setting.addButton((btn) => {
+        btn.setButtonText("Run Auto-tests").setCta();
+        btn.onClick(() => {
+          const selected = collectSelected(this.allTestCases);
+          if (countLeafTestCases(selected) === 0) {
+            new Notice("No test cases selected.");
+            return;
+          }
+          this.onAuto!(selected);
+          this.close();
+        });
+        return btn;
+      });
+    }
   }
 
   onClose() {
@@ -886,11 +921,9 @@ interface TMSSettings {
   showRibbonTestRun: boolean;
   showRibbonResults: boolean;
   showRibbonDashboard: boolean;
-  showRibbonAutoRun: boolean;
   showStatusBarTestRun: boolean;
   showStatusBarResults: boolean;
   showStatusBarDashboard: boolean;
-  showStatusBarAutoRun: boolean;
   playwrightProjectPath: string;
   playwrightCommand: string;
 }
@@ -904,11 +937,9 @@ const DEFAULT_SETTINGS: TMSSettings = {
   showRibbonTestRun: true,
   showRibbonResults: true,
   showRibbonDashboard: true,
-  showRibbonAutoRun: true,
   showStatusBarTestRun: true,
   showStatusBarResults: true,
   showStatusBarDashboard: true,
-  showStatusBarAutoRun: true,
   playwrightProjectPath: "",
   playwrightCommand: "npx playwright test",
 };
@@ -920,11 +951,9 @@ export default class TMSPlugin extends Plugin {
   private ribbonTestRun: HTMLElement | null = null;
   private ribbonResults: HTMLElement | null = null;
   private ribbonDashboard: HTMLElement | null = null;
-  private ribbonAutoRun: HTMLElement | null = null;
   private statusBarTestRun: HTMLElement | null = null;
   private statusBarResults: HTMLElement | null = null;
   private statusBarDashboard: HTMLElement | null = null;
-  private statusBarAutoRun: HTMLElement | null = null;
   private processingFiles = new Set<string>();
   private dashboardRefreshing = false;
 
@@ -937,25 +966,12 @@ export default class TMSPlugin extends Plugin {
 
     this.addCommand({
       id: "generate-test-run-current",
-      name: "Manual Test Run",
+      name: "Test Run",
       checkCallback: (checking) => {
         const file = this.app.workspace.getActiveFile();
         if (!file) return false;
         if (checking) return true;
-        this.generateTestRun(file);
-        return true;
-      },
-    });
-
-    this.addCommand({
-      id: "run-with-automated-tests",
-      name: "Run with Automated Tests",
-      checkCallback: (checking) => {
-        const file = this.app.workspace.getActiveFile();
-        if (!file) return false;
-        if (!this.settings.playwrightProjectPath.trim()) return false;
-        if (checking) return true;
-        this.runWithAutomatedTests(file);
+        this.openTestRunFlow(file);
         return true;
       },
     });
@@ -974,6 +990,24 @@ export default class TMSPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "insert-bug-template",
+      name: "Insert Bug Template",
+      editorCallback: (editor: Editor) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) return;
+        const title = file.basename.startsWith("Bug - ")
+          ? file.basename.replace(/^Bug - /, "")
+          : file.basename;
+        const templateContent = this.bugTemplate(title);
+        if (!templateContent) {
+          new Notice("No bug template configured. Set one in plugin settings.");
+          return;
+        }
+        editor.replaceSelection(templateContent);
+      },
+    });
+
+    this.addCommand({
       id: "open-dashboard",
       name: "Dashboard",
       checkCallback: (checking) => {
@@ -986,14 +1020,9 @@ export default class TMSPlugin extends Plugin {
     });
 
     // Ribbon icons
-    this.ribbonTestRun = this.addRibbonIcon("test-tube", "Manual Test Run", () => {
+    this.ribbonTestRun = this.addRibbonIcon("test-tube", "Test Run", () => {
       const file = this.app.workspace.getActiveFile();
-      if (file) this.generateTestRun(file);
-      else new Notice("No active file open.");
-    });
-    this.ribbonAutoRun = this.addRibbonIcon("zap", "Run with Automated Tests", () => {
-      const file = this.app.workspace.getActiveFile();
-      if (file) this.runWithAutomatedTests(file);
+      if (file) this.openTestRunFlow(file);
       else new Notice("No active file open.");
     });
     this.ribbonResults = this.addRibbonIcon("bar-chart", "Results", () => {
@@ -1014,11 +1043,17 @@ export default class TMSPlugin extends Plugin {
         if (!(abstractFile instanceof TFile) || abstractFile.extension !== "md") return;
         if (!abstractFile.basename.startsWith("Bug - ")) return;
         // Brief delay — Obsidian writes the file async after the create event
-        await new Promise((r) => setTimeout(r, 50));
+        await new Promise((r) => setTimeout(r, 100));
         const current = await this.app.vault.read(abstractFile);
-        if (current.trim() !== "") return; // Already has content
+        // Allow overwriting only if file is empty or contains only Obsidian's auto-generated heading
+        const autoHeading = `# ${abstractFile.basename}`;
+        const hasUserContent = current.trim() !== "" && current.trim() !== autoHeading;
+        if (hasUserContent) return;
         const title = abstractFile.basename.replace(/^Bug - /, "");
-        await this.app.vault.modify(abstractFile, this.bugTemplate(title));
+        const templateContent = this.bugTemplate(title);
+        // Skip if there's nothing to write and file is already empty
+        if (!templateContent && current.trim() === "") return;
+        await this.app.vault.modify(abstractFile, templateContent);
 
         // Move to the configured bugs folder if the file landed elsewhere
         const activeFile = this.app.workspace.getActiveFile();
@@ -1067,21 +1102,11 @@ export default class TMSPlugin extends Plugin {
     // Status bar buttons
     this.statusBarTestRun = this.addStatusBarItem();
     this.statusBarTestRun.addClass("qa-status-bar-btn");
-    this.statusBarTestRun.setAttribute("title", "Manual Test Run");
-    this.statusBarTestRun.textContent = "🧪 Manual";
+    this.statusBarTestRun.setAttribute("title", "Test Run");
+    this.statusBarTestRun.textContent = "🧪 Test Run";
     this.statusBarTestRun.addEventListener("click", () => {
       const file = this.app.workspace.getActiveFile();
-      if (file) this.generateTestRun(file);
-      else new Notice("No active file open.");
-    });
-
-    this.statusBarAutoRun = this.addStatusBarItem();
-    this.statusBarAutoRun.addClass("qa-status-bar-btn");
-    this.statusBarAutoRun.setAttribute("title", "Run with Automated Tests");
-    this.statusBarAutoRun.textContent = "⚡ Auto Run";
-    this.statusBarAutoRun.addEventListener("click", () => {
-      const file = this.app.workspace.getActiveFile();
-      if (file) this.runWithAutomatedTests(file);
+      if (file) this.openTestRunFlow(file);
       else new Notice("No active file open.");
     });
 
@@ -1105,77 +1130,15 @@ export default class TMSPlugin extends Plugin {
       if (!el) return;
       el.style.display = show ? "" : "none";
     };
-    const hasPlaywright = !!this.settings.playwrightProjectPath.trim();
     toggle(this.ribbonTestRun,      this.settings.showRibbonTestRun);
-    toggle(this.ribbonAutoRun,      this.settings.showRibbonAutoRun && hasPlaywright);
     toggle(this.ribbonResults,      this.settings.showRibbonResults);
     toggle(this.ribbonDashboard,    this.settings.showRibbonDashboard && this.settings.enableDashboard);
     toggle(this.statusBarTestRun,   this.settings.showStatusBarTestRun);
-    toggle(this.statusBarAutoRun,   this.settings.showStatusBarAutoRun && hasPlaywright);
     toggle(this.statusBarResults,   this.settings.showStatusBarResults);
     toggle(this.statusBarDashboard, this.settings.showStatusBarDashboard && this.settings.enableDashboard);
   }
 
   // ─── Playwright: run automated tests ──────────────────────────────────────
-
-  private async runWithAutomatedTests(file: TFile) {
-    const content = await this.app.vault.read(file);
-    const testCases = parseTestCases(content);
-
-    if (testCases.length === 0) {
-      new Notice("No test cases found in this file.");
-      return;
-    }
-
-    const allTags = getAllTags(testCases);
-    const suiteName = file.basename;
-
-    const openTagSelect = (prevInclude: string[] = [], prevExclude: string[] = []) => {
-      new TagSelectModal(this.app, allTags, suiteName, (includeTags, excludeTags) => {
-        const filtered = filterByTags(testCases, includeTags, excludeTags);
-
-        new TestReviewModal(
-          this.app, suiteName, testCases, filtered, includeTags, excludeTags,
-          async (selectedCases: TestCase[]) => {
-            const checklist = generateChecklist(selectedCases, suiteName, includeTags, excludeTags);
-            const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-            const runFileName = `${suiteName} - Test Run ${timestamp}.md`;
-            const runsFolder = this.getRunsFolder(suiteName);
-
-            await this.ensureFolder(runsFolder);
-
-            const dashPath = `${runsFolder}/Dashboard.md`;
-            if (this.settings.enableDashboard && !this.app.vault.getAbstractFileByPath(dashPath)) {
-              await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
-            }
-
-            const runPath = `${runsFolder}/${runFileName}`;
-            const runFile = await this.app.vault.create(runPath, checklist);
-
-            if (this.settings.enableDashboard) {
-              const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
-              if (dashFile instanceof TFile) await this.regenerateDashboard(dashFile);
-            }
-
-            const leaf = this.app.workspace.getLeaf();
-            await leaf.openFile(runFile);
-            new Notice(`Test Run created: ${runPath}`);
-
-            const ids = extractTmsIds(checklist);
-            if (ids.length === 0) {
-              new Notice("No TMS IDs (Txxx) found in test run — skipping automated run.");
-              return;
-            }
-
-            this.runPlaywrightTests(runFile, ids);
-          },
-          () => openTagSelect(includeTags, excludeTags)
-        ).open();
-      }, prevInclude, prevExclude).open();
-    };
-
-    openTagSelect();
-  }
 
   private runPlaywrightTests(runFile: TFile, ids: string[]) {
     const projectPath = this.settings.playwrightProjectPath.trim();
@@ -1190,31 +1153,28 @@ export default class TMSPlugin extends Plugin {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const fs = require("fs") as typeof import("fs");
 
-    const tmpResults = path.join(os.tmpdir(), "tms-playwright-results.json");
     const grep = ids.map(id => `\\(${id}\\)`).join("|");
+    const tmpResults = path.join(os.tmpdir(), `tms-pw-${Date.now()}.json`);
+    const displayCmd = `${baseCommand} --grep "${ids.map(id => `(${id})`).join("|")}" --reporter=list`;
 
-    const parts = baseCommand.split(/\s+/);
-    const cmd = parts[0];
-    const baseArgs = parts.slice(1);
-    const args = [...baseArgs, "--grep", grep, "--reporter=json"];
-
-    const displayCmd = `${baseCommand} --grep "${ids.map(id => `(${id})`).join("|")}" --reporter=json`;
     const modal = new PlaywrightProgressModal(this.app, ids, displayCmd);
     modal.open();
 
-    const proc = spawn(cmd, args, {
+    // list → real-time progress in modal; json → written to file via env var
+    const fullCmd = `${baseCommand} --grep "${grep}" --reporter=list,json`;
+
+    const proc = spawn("/bin/zsh", ["-l", "-c", fullCmd], {
       cwd: projectPath,
-      shell: true,
-      env: { ...process.env },
+      env: { ...process.env, PLAYWRIGHT_JSON_OUTPUT_NAME: tmpResults },
     });
 
-    let stdout = "";
-    proc.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    proc.stdout?.on("data", (chunk: Buffer) => modal.appendOutput(chunk.toString()));
     proc.stderr?.on("data", (chunk: Buffer) => modal.appendOutput(chunk.toString()));
 
     proc.on("close", async (code: number | null) => {
       try {
-        const report = JSON.parse(stdout) as PwJsonReport;
+        const jsonContent = fs.readFileSync(tmpResults, "utf-8");
+        const report = JSON.parse(jsonContent) as PwJsonReport;
         const resultMap = parsePwJsonReport(report);
 
         const currentContent = await this.app.vault.read(runFile);
@@ -1230,12 +1190,14 @@ export default class TMSPlugin extends Plugin {
           code === 0
         );
         new Notice(`Playwright sync: ${count} test(s) updated.`);
+
+        if (count > 0) await this.calculateTestResults(runFile);
       } catch (err) {
         modal.appendOutput(`\nFailed to parse results: ${(err as Error).message}\n`);
         modal.setDone("Error parsing Playwright results. Check output above.", false);
+      } finally {
+        try { fs.unlinkSync(tmpResults); } catch { /* ignore */ }
       }
-      // clean up temp file
-      try { fs.unlinkSync(tmpResults); } catch { /* ignore */ }
     });
 
     proc.on("error", (err: Error) => {
@@ -1277,14 +1239,25 @@ export default class TMSPlugin extends Plugin {
     if (tpl) {
       return tpl.replace(/\{\{title\}\}/g, title);
     }
-    return `# ${title}\n`;
+    return "";
   }
 
-  private getBugStatus(bugName: string): string {
+  async createBugFile(bugName: string, sourceFilePath: string): Promise<void> {
+    const filePath = this.getBugFilePath(bugName, sourceFilePath);
+    if (this.app.vault.getAbstractFileByPath(filePath)) return;
+    const folder = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
+    if (folder) await this.ensureFolder(folder);
+    const title = bugName.replace(/^Bug - /, "");
+    await this.app.vault.create(filePath, this.bugTemplate(title));
+    new Notice(`Bug created: ${bugName}`);
+  }
+
+  private getBugStatus(bugName: string): string | null {
     const file = this.app.metadataCache.getFirstLinkpathDest(bugName, "");
-    if (!file) return "UNKNOWN";
+    if (!file) return null;
     const cache = this.app.metadataCache.getFileCache(file);
-    return (cache?.frontmatter?.status as string) ?? "New";
+    const status = cache?.frontmatter?.status as string | undefined;
+    return status != null && status !== "" ? status : null;
   }
 
   private async ensureStatusPropertyType() {
@@ -1306,8 +1279,36 @@ export default class TMSPlugin extends Plugin {
 
   // ─── Core flows ───────────────────────────────────────────────────────────
 
-  private async generateTestRun(file: TFile) {
-    const content = await this.app.vault.read(file);
+  private async openTestRunFlow(file: TFile) {
+    // If opened from a test run file — find the original suite and pre-select existing cases
+    let suiteFile = file;
+    let preselectedNames: Set<string> | null = null;
+
+    if (file.parent?.name.endsWith(" Test Runs")) {
+      const suiteName = file.parent.name.replace(/ Test Runs$/, "");
+      const found = this.app.vault.getFiles().find(
+        (f) => f.basename === suiteName && f.extension === "md"
+      );
+      if (!found) {
+        new Notice(`Suite "${suiteName}.md" not found. Open the test suite file directly.`);
+        return;
+      }
+      suiteFile = found;
+
+      // Collect test case names from the current test run for pre-selection
+      const runContent = await this.app.vault.read(file);
+      const runCases = parseTestCases(runContent);
+      preselectedNames = new Set<string>();
+      const collectNames = (items: TestCase[]) => {
+        for (const tc of items) {
+          if (!tc.isHeading) preselectedNames!.add(tc.name.trim());
+          collectNames(tc.children);
+        }
+      };
+      collectNames(runCases);
+    }
+
+    const content = await this.app.vault.read(suiteFile);
     const testCases = parseTestCases(content);
 
     if (testCases.length === 0) {
@@ -1316,50 +1317,64 @@ export default class TMSPlugin extends Plugin {
     }
 
     const allTags = getAllTags(testCases);
-    const suiteName = file.basename;
+    const suiteName = suiteFile.basename;
+    const hasPlaywright = !!this.settings.playwrightProjectPath.trim();
+
+    const createRunFile = async (selectedCases: TestCase[], includeTags: string[], excludeTags: string[]) => {
+      const checklist = generateChecklist(selectedCases, suiteName, includeTags, excludeTags);
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const runFileName = `${suiteName} - Test Run ${timestamp}.md`;
+      const runsFolder = this.getRunsFolder(suiteName);
+
+      await this.ensureFolder(runsFolder);
+
+      const dashPath = `${runsFolder}/Dashboard.md`;
+      if (this.settings.enableDashboard && !this.app.vault.getAbstractFileByPath(dashPath)) {
+        await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
+      }
+
+      const runPath = `${runsFolder}/${runFileName}`;
+      const runFile = await this.app.vault.create(runPath, checklist);
+
+      if (this.settings.enableDashboard) {
+        const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
+        if (dashFile instanceof TFile) await this.regenerateDashboard(dashFile);
+      }
+
+      const leaf = this.app.workspace.getLeaf();
+      await leaf.openFile(runFile);
+      new Notice(`Test Run created: ${runPath}`);
+
+      return { runFile, checklist };
+    };
 
     const openTagSelect = (prevInclude: string[] = [], prevExclude: string[] = []) => {
       new TagSelectModal(this.app, allTags, suiteName, (includeTags, excludeTags) => {
         const filtered = filterByTags(testCases, includeTags, excludeTags);
+        const preSelected = preselectedNames ? filterByNames(filtered, preselectedNames) : filtered;
 
         new TestReviewModal(
           this.app,
           suiteName,
           testCases,
-          filtered,
+          preSelected,
           includeTags,
           excludeTags,
           async (selectedCases: TestCase[]) => {
-            const checklist = generateChecklist(selectedCases, suiteName, includeTags, excludeTags);
-            const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-            const runFileName = `${suiteName} - Test Run ${timestamp}.md`;
-            const runsFolder = this.getRunsFolder(suiteName);
-
-            await this.ensureFolder(runsFolder);
-
-            // Create and refresh Dashboard (if enabled)
-            const dashPath = `${runsFolder}/Dashboard.md`;
-            if (this.settings.enableDashboard) {
-              if (!this.app.vault.getAbstractFileByPath(dashPath)) {
-                await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
-              }
-            }
-
-            const runPath = `${runsFolder}/${runFileName}`;
-            const newFile = await this.app.vault.create(runPath, checklist);
-
-            if (this.settings.enableDashboard) {
-              const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
-              if (dashFile instanceof TFile) {
-                await this.regenerateDashboard(dashFile);
-              }
-            }
-
-            const leaf = this.app.workspace.getLeaf();
-            await leaf.openFile(newFile);
-            new Notice(`Test Run created: ${runPath}`);
+            await createRunFile(selectedCases, includeTags, excludeTags);
           },
-          () => openTagSelect(includeTags, excludeTags)
+          () => openTagSelect(includeTags, excludeTags),
+          hasPlaywright
+            ? async (selectedCases: TestCase[]) => {
+                const { runFile, checklist } = await createRunFile(selectedCases, includeTags, excludeTags);
+                const ids = extractTmsIds(checklist);
+                if (ids.length === 0) {
+                  new Notice("No TMS IDs (Txxx) found in test run — skipping automated run.");
+                  return;
+                }
+                this.runPlaywrightTests(runFile, ids);
+              }
+            : null
         ).open();
       }, prevInclude, prevExclude).open();
     };
@@ -1367,8 +1382,8 @@ export default class TMSPlugin extends Plugin {
     openTagSelect();
   }
 
-  private async calculateTestResults() {
-    const file = this.app.workspace.getActiveFile();
+  private async calculateTestResults(targetFile?: TFile) {
+    const file = targetFile ?? this.app.workspace.getActiveFile();
     if (!file) return;
 
     let content = await this.app.vault.read(file);
@@ -1438,11 +1453,15 @@ export default class TMSPlugin extends Plugin {
 
     let finalContent = statsContent;
     if (bugNames.length > 0) {
-      const rows = bugNames.map((bugName) => {
-        const status = this.getBugStatus(bugName);
-        return `| [[${bugName}]] | ${status} |`;
-      });
-      finalContent += `\n## Bugs\n\n| Bug | Status |\n| --- | --- |\n${rows.join("\n")}\n`;
+      const bugStatuses = bugNames.map((bugName) => ({ bugName, status: this.getBugStatus(bugName) }));
+      const hasAnyStatus = bugStatuses.some((b) => b.status !== null);
+      if (hasAnyStatus) {
+        const rows = bugStatuses.map(({ bugName, status }) => `| [[${bugName}]] | ${status ?? ""} |`);
+        finalContent += `\n## Bugs\n\n| Bug | Status |\n| --- | --- |\n${rows.join("\n")}\n`;
+      } else {
+        const rows = bugStatuses.map(({ bugName }) => `| [[${bugName}]] |`);
+        finalContent += `\n## Bugs\n\n| Bug |\n| --- |\n${rows.join("\n")}\n`;
+      }
     }
 
     await this.app.vault.modify(file, finalContent);
@@ -1583,20 +1602,29 @@ export default class TMSPlugin extends Plugin {
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean);
 
-    const visibleBugs = Array.from(allBugNames).filter(
-      (bugName) => !hiddenStatuses.includes(this.getBugStatus(bugName).toLowerCase())
-    );
+    const visibleBugs = Array.from(allBugNames).filter((bugName) => {
+      const status = this.getBugStatus(bugName);
+      return !hiddenStatuses.includes((status ?? "").toLowerCase());
+    });
 
-    if (visibleBugs.length > 0) {
+    const visibleBugStatuses = visibleBugs.map((bugName) => ({ bugName, status: this.getBugStatus(bugName) }));
+    const hasAnyStatus = visibleBugStatuses.some((b) => b.status !== null);
+
+    if (visibleBugStatuses.length > 0) {
       md += `## Bugs\n\n`;
-      md += `| Bug | Status |\n`;
-      md += `|-----|--------|\n`;
-      for (const bugName of visibleBugs) {
-        const status = this.getBugStatus(bugName);
-        md += `| [[${bugName}]] | ${status} |\n`;
+      if (hasAnyStatus) {
+        md += `| Bug | Status |\n`;
+        md += `|-----|--------|\n`;
+        for (const { bugName, status } of visibleBugStatuses) {
+          md += `| [[${bugName}]] | ${status ?? ""} |\n`;
+        }
+      } else {
+        md += `| Bug |\n`;
+        md += `|-----|\n`;
+        for (const { bugName } of visibleBugStatuses) {
+          md += `| [[${bugName}]] |\n`;
+        }
       }
-    } else {
-      md += `*No active bugs.*\n`;
     }
 
     return md;
@@ -1670,7 +1698,7 @@ class TMSSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Bug template")
-      .setDesc("Template for new bug pages. Use {{title}} as a placeholder for the bug title. Leave empty for a plain heading only.")
+      .setDesc("Template for new bug pages. Use {{title}} as a placeholder for the bug title. Leave empty to create a blank file (Obsidian shows the filename as title).")
       .addTextArea((ta) => {
         ta.setPlaceholder(
           "---\nstatus: New\ntags: [Bug]\n---\n\n# {{title}}\n\n## Description\n\n## Steps to Reproduce"
@@ -1716,14 +1744,12 @@ class TMSSettingTab extends PluginSettingTab {
     containerEl.createEl("h3", { text: "Buttons" });
 
     const toggles: Array<{ name: string; key: keyof TMSSettings }> = [
-      { name: "Ribbon: Manual Test Run",      key: "showRibbonTestRun"      },
-      { name: "Ribbon: Auto Run",             key: "showRibbonAutoRun"      },
-      { name: "Ribbon: Results",              key: "showRibbonResults"      },
-      { name: "Ribbon: Dashboard",            key: "showRibbonDashboard"    },
-      { name: "Status bar: Manual Test Run",  key: "showStatusBarTestRun"   },
-      { name: "Status bar: Auto Run",         key: "showStatusBarAutoRun"   },
-      { name: "Status bar: Results",          key: "showStatusBarResults"   },
-      { name: "Status bar: Dashboard",        key: "showStatusBarDashboard" },
+      { name: "Ribbon: Test Run",       key: "showRibbonTestRun"      },
+      { name: "Ribbon: Results",        key: "showRibbonResults"      },
+      { name: "Ribbon: Dashboard",      key: "showRibbonDashboard"    },
+      { name: "Status bar: Test Run",   key: "showStatusBarTestRun"   },
+      { name: "Status bar: Results",    key: "showStatusBarResults"   },
+      { name: "Status bar: Dashboard",  key: "showStatusBarDashboard" },
     ];
 
     for (const { name, key } of toggles) {
@@ -1766,71 +1792,5 @@ class TMSSettingTab extends PluginSettingTab {
         });
       });
 
-    // ── Playwright Setup Guide ────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "Playwright Setup Guide" });
-
-    const guide = containerEl.createDiv({ cls: "qa-pw-guide" });
-
-    guide.createEl("p", { text: "Follow these steps once to connect your Playwright tests to TMS:" });
-
-    const steps = guide.createEl("ol", { cls: "qa-pw-steps" });
-
-    const s1 = steps.createEl("li");
-    s1.appendText("Add the TMS ID inside parentheses at the end of each automated test title:");
-    s1.createEl("pre", { cls: "qa-pw-code",
-      text: "test('Login with valid credentials (T01)', async ({ page }) => {\n  // ...\n});\n\ntest('Invalid password (T02)', async ({ page }) => {\n  // ...\n});" });
-
-    const s2 = steps.createEl("li");
-    s2.appendText("Set the ");
-    s2.createEl("strong", { text: "Playwright project path" });
-    s2.appendText(" above — the folder that contains ");
-    s2.createEl("code", { text: "playwright.config.ts" });
-    s2.appendText(".");
-
-    const s3 = steps.createEl("li");
-    s3.appendText("In your Obsidian test suite file, add the same ID at the end of each automated test case:");
-    s3.createEl("pre", { cls: "qa-pw-code",
-      text: "- [ ] Login with valid credentials (T01)\n- [ ] Invalid password (T02)\n- [ ] Check email layout   ← manual, no ID, never touched by automation" });
-
-    const s4 = steps.createEl("li");
-    s4.appendText("Click ");
-    s4.createEl("strong", { text: "⚡ Run with Automated Tests" });
-    s4.appendText(" (ribbon or status bar). The plugin will:");
-    const s4ul = s4.createEl("ul");
-    s4ul.createEl("li", { text: "Create a test run from the current suite" });
-    s4ul.createEl("li", { text: "Extract all (Txxx) IDs from the test run" });
-    s4ul.createEl("li", { text: "Run only matching Playwright tests" });
-    s4ul.createEl("li", { text: "Write pass / fail / skipped results back into the test run" });
-    s4ul.createEl("li", { text: "Manual tests (no ID) are never modified" });
-
-    const s5 = steps.createEl("li");
-    s5.appendText("Results are mapped as: ");
-    s5.createEl("code", { text: "passed → [x]" });
-    s5.appendText("  ");
-    s5.createEl("code", { text: "failed → [f]" });
-    s5.appendText("  ");
-    s5.createEl("code", { text: "skipped → [s]" });
-
-    // ── Hotkeys ───────────────────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "Hotkeys" });
-    const desc = containerEl.createEl("p", { cls: "mod-note" });
-    desc.appendText("To set keyboard shortcuts, go to ");
-    desc.createEl("strong", { text: "Settings → Hotkeys" });
-    desc.appendText(' and search for "Test Management System".');
-
-    // ── Bug creation tip ──────────────────────────────────────────────────────
-    containerEl.createEl("h3", { text: "Creating Bugs" });
-    const bugTip = containerEl.createEl("p", { cls: "mod-note" });
-    bugTip.appendText("In a test run, add an indented line starting with ");
-    bugTip.createEl("code", { text: "!" });
-    bugTip.appendText(" under a test case to create a bug page:");
-    containerEl.createEl("pre", {
-      text: "- [f] ❌ Fail | Test case name\n  ! Bug title here",
-      cls: "mod-note",
-    });
-    containerEl.createEl("p", {
-      text: "Плагін створює сторінку бага. За замовчуванням — лише заголовок. Додайте шаблон вище щоб автоматично наповнювати бага статусом, тегами тощо. Статуси які приховувати на дашборді — налаштовуються у полі «Hidden bug statuses».",
-      cls: "mod-note",
-    });
   }
 }

@@ -166,6 +166,19 @@ function filterByTags(testCases, includeTags, excludeTags) {
   }
   return filtered;
 }
+function filterByNames(testCases, names) {
+  const result = [];
+  for (const tc of testCases) {
+    if (tc.isHeading) {
+      const children = filterByNames(tc.children, names);
+      if (children.length > 0)
+        result.push({ ...tc, children, hasChildren: true });
+    } else if (names.has(tc.name.trim())) {
+      result.push(tc);
+    }
+  }
+  return result;
+}
 function generateChecklist(testCases, suiteName, includeTags, excludeTags) {
   const timestamp = new Date().toLocaleString();
   let filterLine = "";
@@ -287,11 +300,14 @@ ${entries}
 `;
 }
 function extractBugNames(content) {
-  const regex = /\[\[Bug - ([^\]|#]+)/g;
   const seen = /* @__PURE__ */ new Set();
-  let m;
-  while ((m = regex.exec(content)) !== null) {
-    seen.add(`Bug - ${m[1].trim()}`);
+  for (const line of content.split("\n")) {
+    const stripped = line.replace(/`[^`]+`/g, "").replace(/\*\*[^*]+\*\*/g, "");
+    const regex = /\[\[Bug - ([^\]|#]+)/g;
+    let m;
+    while ((m = regex.exec(stripped)) !== null) {
+      seen.add(`Bug - ${m[1].trim()}`);
+    }
   }
   return Array.from(seen);
 }
@@ -333,10 +349,10 @@ function parsePwJsonReport(report) {
   return map;
 }
 function applyPlaywrightResults(content, resultMap) {
-  const charMap = { passed: "x", failed: "f", skipped: "s" };
+  const charMap = { passed: "p", failed: "f", skipped: "s" };
   let count = 0;
   const updated = content.split("\n").map((line) => {
-    const m = line.match(/\(T(\d+)\)\s*$/i);
+    const m = line.match(/\(T(\d+)\)/i);
     if (!m)
       return line;
     const status = resultMap.get(`T${m[1]}`);
@@ -373,16 +389,16 @@ var PlaywrightProgressModal = class extends import_obsidian.Modal {
     cmdEl.style.fontSize = "12px";
     this.statusEl = contentEl.createEl("p", { text: "Running... 0s", cls: "qa-pw-status" });
     this.outputEl = contentEl.createEl("pre", { cls: "qa-pw-output" });
-    new import_obsidian.Setting(contentEl).addButton((btn) => {
-      this.closeBtn = btn.buttonEl;
-      btn.setButtonText("Close").setDisabled(true).onClick(() => this.close());
-    });
+    this.closeBtn = contentEl.createEl("button", { text: "Close" });
+    this.closeBtn.disabled = true;
+    this.closeBtn.style.marginTop = "12px";
+    this.closeBtn.addEventListener("click", () => this.close());
     this.intervalId = window.setInterval(() => {
       var _a;
-      if (!((_a = this.closeBtn) == null ? void 0 : _a.disabled))
-        return;
       const elapsed = Math.floor((Date.now() - this.startTime) / 1e3);
-      this.statusEl.textContent = `Running... ${elapsed}s`;
+      if ((_a = this.statusEl.textContent) == null ? void 0 : _a.startsWith("Running")) {
+        this.statusEl.textContent = `Running... ${elapsed}s`;
+      }
     }, 1e3);
   }
   appendOutput(text) {
@@ -396,8 +412,7 @@ var PlaywrightProgressModal = class extends import_obsidian.Modal {
     }
     this.statusEl.textContent = message;
     this.statusEl.style.color = success ? "var(--color-green)" : "var(--color-red)";
-    if (this.closeBtn)
-      this.closeBtn.disabled = false;
+    this.closeBtn.disabled = false;
   }
   onClose() {
     if (this.intervalId !== null)
@@ -510,14 +525,15 @@ var TagSelectModal = class extends import_obsidian.Modal {
   }
 };
 var TestReviewModal = class extends import_obsidian.Modal {
-  constructor(app, suiteName, allTestCases, filteredTestCases, includeTags, excludeTags, onConfirm, onBack) {
+  constructor(app, suiteName, allTestCases, filteredTestCases, includeTags, excludeTags, onManual, onBack, onAuto = null) {
     super(app);
     this.suiteName = suiteName;
     this.allTestCases = allTestCases;
     this.includeTags = includeTags;
     this.excludeTags = excludeTags;
-    this.onConfirm = onConfirm;
+    this.onManual = onManual;
     this.onBack = onBack;
+    this.onAuto = onAuto;
     this.checkedItems = /* @__PURE__ */ new Set();
     this.checkboxRefs = [];
     this.headingCheckboxRefs = [];
@@ -676,35 +692,50 @@ var TestReviewModal = class extends import_obsidian.Modal {
       });
     };
     renderTree(this.allTestCases, listEl, true, 0, 0);
-    new import_obsidian.Setting(contentEl).addButton(
+    const collectSelected = (items) => {
+      const result = [];
+      for (const tc of items) {
+        if (tc.isHeading) {
+          const selectedChildren = collectSelected(tc.children);
+          if (selectedChildren.length > 0)
+            result.push({ ...tc, children: selectedChildren, hasChildren: true });
+        } else if (this.checkedItems.has(tc.lineNumber)) {
+          result.push({ ...tc, children: collectSelected(tc.children) });
+        }
+      }
+      return result;
+    };
+    const setting = new import_obsidian.Setting(contentEl).addButton(
       (btn) => btn.setButtonText("\u2190 Back").onClick(() => {
         this.close();
         this.onBack();
       })
     ).addButton(
-      (btn) => btn.setButtonText("Generate Test Run").setCta().onClick(() => {
-        const collectSelected = (items) => {
-          const result = [];
-          for (const tc of items) {
-            if (tc.isHeading) {
-              const selectedChildren = collectSelected(tc.children);
-              if (selectedChildren.length > 0)
-                result.push({ ...tc, children: selectedChildren, hasChildren: true });
-            } else if (this.checkedItems.has(tc.lineNumber)) {
-              result.push({ ...tc, children: collectSelected(tc.children) });
-            }
-          }
-          return result;
-        };
+      (btn) => btn.setButtonText("Manual Test Run").onClick(() => {
         const selected = collectSelected(this.allTestCases);
         if (countLeafTestCases(selected) === 0) {
           new import_obsidian.Notice("No test cases selected.");
           return;
         }
-        this.onConfirm(selected);
+        this.onManual(selected);
         this.close();
       })
     );
+    if (this.onAuto !== null) {
+      setting.addButton((btn) => {
+        btn.setButtonText("Run Auto-tests").setCta();
+        btn.onClick(() => {
+          const selected = collectSelected(this.allTestCases);
+          if (countLeafTestCases(selected) === 0) {
+            new import_obsidian.Notice("No test cases selected.");
+            return;
+          }
+          this.onAuto(selected);
+          this.close();
+        });
+        return btn;
+      });
+    }
   }
   onClose() {
     this.contentEl.empty();
@@ -800,11 +831,9 @@ var DEFAULT_SETTINGS = {
   showRibbonTestRun: true,
   showRibbonResults: true,
   showRibbonDashboard: true,
-  showRibbonAutoRun: true,
   showStatusBarTestRun: true,
   showStatusBarResults: true,
   showStatusBarDashboard: true,
-  showStatusBarAutoRun: true,
   playwrightProjectPath: "",
   playwrightCommand: "npx playwright test"
 };
@@ -815,11 +844,9 @@ var TMSPlugin = class extends import_obsidian.Plugin {
     this.ribbonTestRun = null;
     this.ribbonResults = null;
     this.ribbonDashboard = null;
-    this.ribbonAutoRun = null;
     this.statusBarTestRun = null;
     this.statusBarResults = null;
     this.statusBarDashboard = null;
-    this.statusBarAutoRun = null;
     this.processingFiles = /* @__PURE__ */ new Set();
     this.dashboardRefreshing = false;
   }
@@ -831,29 +858,14 @@ var TMSPlugin = class extends import_obsidian.Plugin {
     await this.ensureStatusPropertyType();
     this.addCommand({
       id: "generate-test-run-current",
-      name: "Manual Test Run",
+      name: "Test Run",
       checkCallback: (checking) => {
         const file = this.app.workspace.getActiveFile();
         if (!file)
           return false;
         if (checking)
           return true;
-        this.generateTestRun(file);
-        return true;
-      }
-    });
-    this.addCommand({
-      id: "run-with-automated-tests",
-      name: "Run with Automated Tests",
-      checkCallback: (checking) => {
-        const file = this.app.workspace.getActiveFile();
-        if (!file)
-          return false;
-        if (!this.settings.playwrightProjectPath.trim())
-          return false;
-        if (checking)
-          return true;
-        this.runWithAutomatedTests(file);
+        this.openTestRunFlow(file);
         return true;
       }
     });
@@ -873,6 +885,22 @@ var TMSPlugin = class extends import_obsidian.Plugin {
       }
     });
     this.addCommand({
+      id: "insert-bug-template",
+      name: "Insert Bug Template",
+      editorCallback: (editor) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file)
+          return;
+        const title = file.basename.startsWith("Bug - ") ? file.basename.replace(/^Bug - /, "") : file.basename;
+        const templateContent = this.bugTemplate(title);
+        if (!templateContent) {
+          new import_obsidian.Notice("No bug template configured. Set one in plugin settings.");
+          return;
+        }
+        editor.replaceSelection(templateContent);
+      }
+    });
+    this.addCommand({
       id: "open-dashboard",
       name: "Dashboard",
       checkCallback: (checking) => {
@@ -885,17 +913,10 @@ var TMSPlugin = class extends import_obsidian.Plugin {
         return true;
       }
     });
-    this.ribbonTestRun = this.addRibbonIcon("test-tube", "Manual Test Run", () => {
+    this.ribbonTestRun = this.addRibbonIcon("test-tube", "Test Run", () => {
       const file = this.app.workspace.getActiveFile();
       if (file)
-        this.generateTestRun(file);
-      else
-        new import_obsidian.Notice("No active file open.");
-    });
-    this.ribbonAutoRun = this.addRibbonIcon("zap", "Run with Automated Tests", () => {
-      const file = this.app.workspace.getActiveFile();
-      if (file)
-        this.runWithAutomatedTests(file);
+        this.openTestRunFlow(file);
       else
         new import_obsidian.Notice("No active file open.");
     });
@@ -915,12 +936,17 @@ var TMSPlugin = class extends import_obsidian.Plugin {
           return;
         if (!abstractFile.basename.startsWith("Bug - "))
           return;
-        await new Promise((r) => setTimeout(r, 50));
+        await new Promise((r) => setTimeout(r, 100));
         const current = await this.app.vault.read(abstractFile);
-        if (current.trim() !== "")
+        const autoHeading = `# ${abstractFile.basename}`;
+        const hasUserContent = current.trim() !== "" && current.trim() !== autoHeading;
+        if (hasUserContent)
           return;
         const title = abstractFile.basename.replace(/^Bug - /, "");
-        await this.app.vault.modify(abstractFile, this.bugTemplate(title));
+        const templateContent = this.bugTemplate(title);
+        if (!templateContent && current.trim() === "")
+          return;
+        await this.app.vault.modify(abstractFile, templateContent);
         const activeFile = this.app.workspace.getActiveFile();
         const sourcePath = (_a = activeFile == null ? void 0 : activeFile.path) != null ? _a : abstractFile.path;
         const targetPath = this.getBugFilePath(abstractFile.basename, sourcePath);
@@ -963,23 +989,12 @@ var TMSPlugin = class extends import_obsidian.Plugin {
     );
     this.statusBarTestRun = this.addStatusBarItem();
     this.statusBarTestRun.addClass("qa-status-bar-btn");
-    this.statusBarTestRun.setAttribute("title", "Manual Test Run");
-    this.statusBarTestRun.textContent = "\u{1F9EA} Manual";
+    this.statusBarTestRun.setAttribute("title", "Test Run");
+    this.statusBarTestRun.textContent = "\u{1F9EA} Test Run";
     this.statusBarTestRun.addEventListener("click", () => {
       const file = this.app.workspace.getActiveFile();
       if (file)
-        this.generateTestRun(file);
-      else
-        new import_obsidian.Notice("No active file open.");
-    });
-    this.statusBarAutoRun = this.addStatusBarItem();
-    this.statusBarAutoRun.addClass("qa-status-bar-btn");
-    this.statusBarAutoRun.setAttribute("title", "Run with Automated Tests");
-    this.statusBarAutoRun.textContent = "\u26A1 Auto Run";
-    this.statusBarAutoRun.addEventListener("click", () => {
-      const file = this.app.workspace.getActiveFile();
-      if (file)
-        this.runWithAutomatedTests(file);
+        this.openTestRunFlow(file);
       else
         new import_obsidian.Notice("No active file open.");
     });
@@ -1001,69 +1016,14 @@ var TMSPlugin = class extends import_obsidian.Plugin {
         return;
       el.style.display = show ? "" : "none";
     };
-    const hasPlaywright = !!this.settings.playwrightProjectPath.trim();
     toggle(this.ribbonTestRun, this.settings.showRibbonTestRun);
-    toggle(this.ribbonAutoRun, this.settings.showRibbonAutoRun && hasPlaywright);
     toggle(this.ribbonResults, this.settings.showRibbonResults);
     toggle(this.ribbonDashboard, this.settings.showRibbonDashboard && this.settings.enableDashboard);
     toggle(this.statusBarTestRun, this.settings.showStatusBarTestRun);
-    toggle(this.statusBarAutoRun, this.settings.showStatusBarAutoRun && hasPlaywright);
     toggle(this.statusBarResults, this.settings.showStatusBarResults);
     toggle(this.statusBarDashboard, this.settings.showStatusBarDashboard && this.settings.enableDashboard);
   }
   // ─── Playwright: run automated tests ──────────────────────────────────────
-  async runWithAutomatedTests(file) {
-    const content = await this.app.vault.read(file);
-    const testCases = parseTestCases(content);
-    if (testCases.length === 0) {
-      new import_obsidian.Notice("No test cases found in this file.");
-      return;
-    }
-    const allTags = getAllTags(testCases);
-    const suiteName = file.basename;
-    const openTagSelect = (prevInclude = [], prevExclude = []) => {
-      new TagSelectModal(this.app, allTags, suiteName, (includeTags, excludeTags) => {
-        const filtered = filterByTags(testCases, includeTags, excludeTags);
-        new TestReviewModal(
-          this.app,
-          suiteName,
-          testCases,
-          filtered,
-          includeTags,
-          excludeTags,
-          async (selectedCases) => {
-            const checklist = generateChecklist(selectedCases, suiteName, includeTags, excludeTags);
-            const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-            const runFileName = `${suiteName} - Test Run ${timestamp}.md`;
-            const runsFolder = this.getRunsFolder(suiteName);
-            await this.ensureFolder(runsFolder);
-            const dashPath = `${runsFolder}/Dashboard.md`;
-            if (this.settings.enableDashboard && !this.app.vault.getAbstractFileByPath(dashPath)) {
-              await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
-            }
-            const runPath = `${runsFolder}/${runFileName}`;
-            const runFile = await this.app.vault.create(runPath, checklist);
-            if (this.settings.enableDashboard) {
-              const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
-              if (dashFile instanceof import_obsidian.TFile)
-                await this.regenerateDashboard(dashFile);
-            }
-            const leaf = this.app.workspace.getLeaf();
-            await leaf.openFile(runFile);
-            new import_obsidian.Notice(`Test Run created: ${runPath}`);
-            const ids = extractTmsIds(checklist);
-            if (ids.length === 0) {
-              new import_obsidian.Notice("No TMS IDs (Txxx) found in test run \u2014 skipping automated run.");
-              return;
-            }
-            this.runPlaywrightTests(runFile, ids);
-          },
-          () => openTagSelect(includeTags, excludeTags)
-        ).open();
-      }, prevInclude, prevExclude).open();
-    };
-    openTagSelect();
-  }
   runPlaywrightTests(runFile, ids) {
     var _a, _b;
     const projectPath = this.settings.playwrightProjectPath.trim();
@@ -1072,28 +1032,22 @@ var TMSPlugin = class extends import_obsidian.Plugin {
     const os = require("os");
     const path = require("path");
     const fs = require("fs");
-    const tmpResults = path.join(os.tmpdir(), "tms-playwright-results.json");
     const grep = ids.map((id) => `\\(${id}\\)`).join("|");
-    const parts = baseCommand.split(/\s+/);
-    const cmd = parts[0];
-    const baseArgs = parts.slice(1);
-    const args = [...baseArgs, "--grep", grep, "--reporter=json"];
-    const displayCmd = `${baseCommand} --grep "${ids.map((id) => `(${id})`).join("|")}" --reporter=json`;
+    const tmpResults = path.join(os.tmpdir(), `tms-pw-${Date.now()}.json`);
+    const displayCmd = `${baseCommand} --grep "${ids.map((id) => `(${id})`).join("|")}" --reporter=list`;
     const modal = new PlaywrightProgressModal(this.app, ids, displayCmd);
     modal.open();
-    const proc = spawn(cmd, args, {
+    const fullCmd = `${baseCommand} --grep "${grep}" --reporter=list,json`;
+    const proc = spawn("/bin/zsh", ["-l", "-c", fullCmd], {
       cwd: projectPath,
-      shell: true,
-      env: { ...process.env }
+      env: { ...process.env, PLAYWRIGHT_JSON_OUTPUT_NAME: tmpResults }
     });
-    let stdout = "";
-    (_a = proc.stdout) == null ? void 0 : _a.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
+    (_a = proc.stdout) == null ? void 0 : _a.on("data", (chunk) => modal.appendOutput(chunk.toString()));
     (_b = proc.stderr) == null ? void 0 : _b.on("data", (chunk) => modal.appendOutput(chunk.toString()));
     proc.on("close", async (code) => {
       try {
-        const report = JSON.parse(stdout);
+        const jsonContent = fs.readFileSync(tmpResults, "utf-8");
+        const report = JSON.parse(jsonContent);
         const resultMap = parsePwJsonReport(report);
         const currentContent = await this.app.vault.read(runFile);
         const { updated, count } = applyPlaywrightResults(currentContent, resultMap);
@@ -1107,15 +1061,18 @@ var TMSPlugin = class extends import_obsidian.Plugin {
           code === 0
         );
         new import_obsidian.Notice(`Playwright sync: ${count} test(s) updated.`);
+        if (count > 0)
+          await this.calculateTestResults(runFile);
       } catch (err) {
         modal.appendOutput(`
 Failed to parse results: ${err.message}
 `);
         modal.setDone("Error parsing Playwright results. Check output above.", false);
-      }
-      try {
-        fs.unlinkSync(tmpResults);
-      } catch (e) {
+      } finally {
+        try {
+          fs.unlinkSync(tmpResults);
+        } catch (e) {
+        }
       }
     });
     proc.on("error", (err) => {
@@ -1154,16 +1111,27 @@ Failed to start process: ${err.message}
     if (tpl) {
       return tpl.replace(/\{\{title\}\}/g, title);
     }
-    return `# ${title}
-`;
+    return "";
+  }
+  async createBugFile(bugName, sourceFilePath) {
+    const filePath = this.getBugFilePath(bugName, sourceFilePath);
+    if (this.app.vault.getAbstractFileByPath(filePath))
+      return;
+    const folder = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
+    if (folder)
+      await this.ensureFolder(folder);
+    const title = bugName.replace(/^Bug - /, "");
+    await this.app.vault.create(filePath, this.bugTemplate(title));
+    new import_obsidian.Notice(`Bug created: ${bugName}`);
   }
   getBugStatus(bugName) {
-    var _a, _b;
+    var _a;
     const file = this.app.metadataCache.getFirstLinkpathDest(bugName, "");
     if (!file)
-      return "UNKNOWN";
+      return null;
     const cache = this.app.metadataCache.getFileCache(file);
-    return (_b = (_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.status) != null ? _b : "New";
+    const status = (_a = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a.status;
+    return status != null && status !== "" ? status : null;
   }
   async ensureStatusPropertyType() {
     try {
@@ -1185,57 +1153,94 @@ Failed to start process: ${err.message}
     }
   }
   // ─── Core flows ───────────────────────────────────────────────────────────
-  async generateTestRun(file) {
-    const content = await this.app.vault.read(file);
+  async openTestRunFlow(file) {
+    var _a;
+    let suiteFile = file;
+    let preselectedNames = null;
+    if ((_a = file.parent) == null ? void 0 : _a.name.endsWith(" Test Runs")) {
+      const suiteName2 = file.parent.name.replace(/ Test Runs$/, "");
+      const found = this.app.vault.getFiles().find(
+        (f) => f.basename === suiteName2 && f.extension === "md"
+      );
+      if (!found) {
+        new import_obsidian.Notice(`Suite "${suiteName2}.md" not found. Open the test suite file directly.`);
+        return;
+      }
+      suiteFile = found;
+      const runContent = await this.app.vault.read(file);
+      const runCases = parseTestCases(runContent);
+      preselectedNames = /* @__PURE__ */ new Set();
+      const collectNames = (items) => {
+        for (const tc of items) {
+          if (!tc.isHeading)
+            preselectedNames.add(tc.name.trim());
+          collectNames(tc.children);
+        }
+      };
+      collectNames(runCases);
+    }
+    const content = await this.app.vault.read(suiteFile);
     const testCases = parseTestCases(content);
     if (testCases.length === 0) {
       new import_obsidian.Notice("No test cases found in this file.");
       return;
     }
     const allTags = getAllTags(testCases);
-    const suiteName = file.basename;
+    const suiteName = suiteFile.basename;
+    const hasPlaywright = !!this.settings.playwrightProjectPath.trim();
+    const createRunFile = async (selectedCases, includeTags, excludeTags) => {
+      const checklist = generateChecklist(selectedCases, suiteName, includeTags, excludeTags);
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const runFileName = `${suiteName} - Test Run ${timestamp}.md`;
+      const runsFolder = this.getRunsFolder(suiteName);
+      await this.ensureFolder(runsFolder);
+      const dashPath = `${runsFolder}/Dashboard.md`;
+      if (this.settings.enableDashboard && !this.app.vault.getAbstractFileByPath(dashPath)) {
+        await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
+      }
+      const runPath = `${runsFolder}/${runFileName}`;
+      const runFile = await this.app.vault.create(runPath, checklist);
+      if (this.settings.enableDashboard) {
+        const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
+        if (dashFile instanceof import_obsidian.TFile)
+          await this.regenerateDashboard(dashFile);
+      }
+      const leaf = this.app.workspace.getLeaf();
+      await leaf.openFile(runFile);
+      new import_obsidian.Notice(`Test Run created: ${runPath}`);
+      return { runFile, checklist };
+    };
     const openTagSelect = (prevInclude = [], prevExclude = []) => {
       new TagSelectModal(this.app, allTags, suiteName, (includeTags, excludeTags) => {
         const filtered = filterByTags(testCases, includeTags, excludeTags);
+        const preSelected = preselectedNames ? filterByNames(filtered, preselectedNames) : filtered;
         new TestReviewModal(
           this.app,
           suiteName,
           testCases,
-          filtered,
+          preSelected,
           includeTags,
           excludeTags,
           async (selectedCases) => {
-            const checklist = generateChecklist(selectedCases, suiteName, includeTags, excludeTags);
-            const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-            const runFileName = `${suiteName} - Test Run ${timestamp}.md`;
-            const runsFolder = this.getRunsFolder(suiteName);
-            await this.ensureFolder(runsFolder);
-            const dashPath = `${runsFolder}/Dashboard.md`;
-            if (this.settings.enableDashboard) {
-              if (!this.app.vault.getAbstractFileByPath(dashPath)) {
-                await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
-              }
-            }
-            const runPath = `${runsFolder}/${runFileName}`;
-            const newFile = await this.app.vault.create(runPath, checklist);
-            if (this.settings.enableDashboard) {
-              const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
-              if (dashFile instanceof import_obsidian.TFile) {
-                await this.regenerateDashboard(dashFile);
-              }
-            }
-            const leaf = this.app.workspace.getLeaf();
-            await leaf.openFile(newFile);
-            new import_obsidian.Notice(`Test Run created: ${runPath}`);
+            await createRunFile(selectedCases, includeTags, excludeTags);
           },
-          () => openTagSelect(includeTags, excludeTags)
+          () => openTagSelect(includeTags, excludeTags),
+          hasPlaywright ? async (selectedCases) => {
+            const { runFile, checklist } = await createRunFile(selectedCases, includeTags, excludeTags);
+            const ids = extractTmsIds(checklist);
+            if (ids.length === 0) {
+              new import_obsidian.Notice("No TMS IDs (Txxx) found in test run \u2014 skipping automated run.");
+              return;
+            }
+            this.runPlaywrightTests(runFile, ids);
+          } : null
         ).open();
       }, prevInclude, prevExclude).open();
     };
     openTagSelect();
   }
-  async calculateTestResults() {
-    const file = this.app.workspace.getActiveFile();
+  async calculateTestResults(targetFile) {
+    const file = targetFile != null ? targetFile : this.app.workspace.getActiveFile();
     if (!file)
       return;
     let content = await this.app.vault.read(file);
@@ -1297,17 +1302,27 @@ Failed to start process: ${err.message}
       await new Promise((r) => setTimeout(r, 300));
     let finalContent = statsContent;
     if (bugNames.length > 0) {
-      const rows = bugNames.map((bugName) => {
-        const status = this.getBugStatus(bugName);
-        return `| [[${bugName}]] | ${status} |`;
-      });
-      finalContent += `
+      const bugStatuses = bugNames.map((bugName) => ({ bugName, status: this.getBugStatus(bugName) }));
+      const hasAnyStatus = bugStatuses.some((b) => b.status !== null);
+      if (hasAnyStatus) {
+        const rows = bugStatuses.map(({ bugName, status }) => `| [[${bugName}]] | ${status != null ? status : ""} |`);
+        finalContent += `
 ## Bugs
 
 | Bug | Status |
 | --- | --- |
 ${rows.join("\n")}
 `;
+      } else {
+        const rows = bugStatuses.map(({ bugName }) => `| [[${bugName}]] |`);
+        finalContent += `
+## Bugs
+
+| Bug |
+| --- |
+${rows.join("\n")}
+`;
+      }
     }
     await this.app.vault.modify(file, finalContent);
     new import_obsidian.Notice("Test results calculated!");
@@ -1431,25 +1446,35 @@ ${rows.join("\n")}
     }
     md += "\n";
     const hiddenStatuses = this.settings.dashboardHiddenStatuses.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-    const visibleBugs = Array.from(allBugNames).filter(
-      (bugName) => !hiddenStatuses.includes(this.getBugStatus(bugName).toLowerCase())
-    );
-    if (visibleBugs.length > 0) {
+    const visibleBugs = Array.from(allBugNames).filter((bugName) => {
+      const status = this.getBugStatus(bugName);
+      return !hiddenStatuses.includes((status != null ? status : "").toLowerCase());
+    });
+    const visibleBugStatuses = visibleBugs.map((bugName) => ({ bugName, status: this.getBugStatus(bugName) }));
+    const hasAnyStatus = visibleBugStatuses.some((b) => b.status !== null);
+    if (visibleBugStatuses.length > 0) {
       md += `## Bugs
 
 `;
-      md += `| Bug | Status |
+      if (hasAnyStatus) {
+        md += `| Bug | Status |
 `;
-      md += `|-----|--------|
+        md += `|-----|--------|
 `;
-      for (const bugName of visibleBugs) {
-        const status = this.getBugStatus(bugName);
-        md += `| [[${bugName}]] | ${status} |
+        for (const { bugName, status } of visibleBugStatuses) {
+          md += `| [[${bugName}]] | ${status != null ? status : ""} |
 `;
+        }
+      } else {
+        md += `| Bug |
+`;
+        md += `|-----|
+`;
+        for (const { bugName } of visibleBugStatuses) {
+          md += `| [[${bugName}]] |
+`;
+        }
       }
-    } else {
-      md += `*No active bugs.*
-`;
     }
     return md;
   }
@@ -1496,7 +1521,7 @@ var TMSSettingTab = class extends import_obsidian.PluginSettingTab {
         }).open();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Bug template").setDesc("Template for new bug pages. Use {{title}} as a placeholder for the bug title. Leave empty for a plain heading only.").addTextArea((ta) => {
+    new import_obsidian.Setting(containerEl).setName("Bug template").setDesc("Template for new bug pages. Use {{title}} as a placeholder for the bug title. Leave empty to create a blank file (Obsidian shows the filename as title).").addTextArea((ta) => {
       ta.setPlaceholder(
         "---\nstatus: New\ntags: [Bug]\n---\n\n# {{title}}\n\n## Description\n\n## Steps to Reproduce"
       ).setValue(this.plugin.settings.bugTemplate);
@@ -1526,12 +1551,10 @@ var TMSSettingTab = class extends import_obsidian.PluginSettingTab {
     });
     containerEl.createEl("h3", { text: "Buttons" });
     const toggles = [
-      { name: "Ribbon: Manual Test Run", key: "showRibbonTestRun" },
-      { name: "Ribbon: Auto Run", key: "showRibbonAutoRun" },
+      { name: "Ribbon: Test Run", key: "showRibbonTestRun" },
       { name: "Ribbon: Results", key: "showRibbonResults" },
       { name: "Ribbon: Dashboard", key: "showRibbonDashboard" },
-      { name: "Status bar: Manual Test Run", key: "showStatusBarTestRun" },
-      { name: "Status bar: Auto Run", key: "showStatusBarAutoRun" },
+      { name: "Status bar: Test Run", key: "showStatusBarTestRun" },
       { name: "Status bar: Results", key: "showStatusBarResults" },
       { name: "Status bar: Dashboard", key: "showStatusBarDashboard" }
     ];
@@ -1561,63 +1584,6 @@ var TMSSettingTab = class extends import_obsidian.PluginSettingTab {
         this.plugin.settings.playwrightCommand = value;
         await this.plugin.saveData(this.plugin.settings);
       });
-    });
-    containerEl.createEl("h3", { text: "Playwright Setup Guide" });
-    const guide = containerEl.createDiv({ cls: "qa-pw-guide" });
-    guide.createEl("p", { text: "Follow these steps once to connect your Playwright tests to TMS:" });
-    const steps = guide.createEl("ol", { cls: "qa-pw-steps" });
-    const s1 = steps.createEl("li");
-    s1.appendText("Add the TMS ID inside parentheses at the end of each automated test title:");
-    s1.createEl("pre", {
-      cls: "qa-pw-code",
-      text: "test('Login with valid credentials (T01)', async ({ page }) => {\n  // ...\n});\n\ntest('Invalid password (T02)', async ({ page }) => {\n  // ...\n});"
-    });
-    const s2 = steps.createEl("li");
-    s2.appendText("Set the ");
-    s2.createEl("strong", { text: "Playwright project path" });
-    s2.appendText(" above \u2014 the folder that contains ");
-    s2.createEl("code", { text: "playwright.config.ts" });
-    s2.appendText(".");
-    const s3 = steps.createEl("li");
-    s3.appendText("In your Obsidian test suite file, add the same ID at the end of each automated test case:");
-    s3.createEl("pre", {
-      cls: "qa-pw-code",
-      text: "- [ ] Login with valid credentials (T01)\n- [ ] Invalid password (T02)\n- [ ] Check email layout   \u2190 manual, no ID, never touched by automation"
-    });
-    const s4 = steps.createEl("li");
-    s4.appendText("Click ");
-    s4.createEl("strong", { text: "\u26A1 Run with Automated Tests" });
-    s4.appendText(" (ribbon or status bar). The plugin will:");
-    const s4ul = s4.createEl("ul");
-    s4ul.createEl("li", { text: "Create a test run from the current suite" });
-    s4ul.createEl("li", { text: "Extract all (Txxx) IDs from the test run" });
-    s4ul.createEl("li", { text: "Run only matching Playwright tests" });
-    s4ul.createEl("li", { text: "Write pass / fail / skipped results back into the test run" });
-    s4ul.createEl("li", { text: "Manual tests (no ID) are never modified" });
-    const s5 = steps.createEl("li");
-    s5.appendText("Results are mapped as: ");
-    s5.createEl("code", { text: "passed \u2192 [x]" });
-    s5.appendText("  ");
-    s5.createEl("code", { text: "failed \u2192 [f]" });
-    s5.appendText("  ");
-    s5.createEl("code", { text: "skipped \u2192 [s]" });
-    containerEl.createEl("h3", { text: "Hotkeys" });
-    const desc = containerEl.createEl("p", { cls: "mod-note" });
-    desc.appendText("To set keyboard shortcuts, go to ");
-    desc.createEl("strong", { text: "Settings \u2192 Hotkeys" });
-    desc.appendText(' and search for "Test Management System".');
-    containerEl.createEl("h3", { text: "Creating Bugs" });
-    const bugTip = containerEl.createEl("p", { cls: "mod-note" });
-    bugTip.appendText("In a test run, add an indented line starting with ");
-    bugTip.createEl("code", { text: "!" });
-    bugTip.appendText(" under a test case to create a bug page:");
-    containerEl.createEl("pre", {
-      text: "- [f] \u274C Fail | Test case name\n  ! Bug title here",
-      cls: "mod-note"
-    });
-    containerEl.createEl("p", {
-      text: "\u041F\u043B\u0430\u0433\u0456\u043D \u0441\u0442\u0432\u043E\u0440\u044E\u0454 \u0441\u0442\u043E\u0440\u0456\u043D\u043A\u0443 \u0431\u0430\u0433\u0430. \u0417\u0430 \u0437\u0430\u043C\u043E\u0432\u0447\u0443\u0432\u0430\u043D\u043D\u044F\u043C \u2014 \u043B\u0438\u0448\u0435 \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043E\u043A. \u0414\u043E\u0434\u0430\u0439\u0442\u0435 \u0448\u0430\u0431\u043B\u043E\u043D \u0432\u0438\u0449\u0435 \u0449\u043E\u0431 \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u043D\u043E \u043D\u0430\u043F\u043E\u0432\u043D\u044E\u0432\u0430\u0442\u0438 \u0431\u0430\u0433\u0430 \u0441\u0442\u0430\u0442\u0443\u0441\u043E\u043C, \u0442\u0435\u0433\u0430\u043C\u0438 \u0442\u043E\u0449\u043E. \u0421\u0442\u0430\u0442\u0443\u0441\u0438 \u044F\u043A\u0456 \u043F\u0440\u0438\u0445\u043E\u0432\u0443\u0432\u0430\u0442\u0438 \u043D\u0430 \u0434\u0430\u0448\u0431\u043E\u0440\u0434\u0456 \u2014 \u043D\u0430\u043B\u0430\u0448\u0442\u043E\u0432\u0443\u044E\u0442\u044C\u0441\u044F \u0443 \u043F\u043E\u043B\u0456 \xABHidden bug statuses\xBB.",
-      cls: "mod-note"
     });
   }
 };
