@@ -226,9 +226,18 @@ function filterByNames(testCases: TestCase[], names: Set<string>): TestCase[] {
   return result;
 }
 
+function offsetLineNumbers(items: TestCase[], offset: number): TestCase[] {
+  return items.map((tc) => ({
+    ...tc,
+    lineNumber: tc.lineNumber + offset,
+    children: offsetLineNumbers(tc.children, offset),
+  }));
+}
+
 function generateChecklist(
   testCases: TestCase[],
   suiteName: string,
+  suiteLinkNames: string[],
   includeTags: string[],
   excludeTags: string[]
 ): string {
@@ -240,7 +249,9 @@ function generateChecklist(
     filterLine += `\n**Exclude:** ${excludeTags.map((t) => `@${t}`).join(" ")}`;
 
   let md = `# Test Run: ${suiteName}\n`;
-  md += `**Test Suite:** [[${suiteName}]]\n`;
+  md += suiteLinkNames.length === 1
+    ? `**Test Suite:** [[${suiteLinkNames[0]}]]\n`
+    : `**Test Suites:** ${suiteLinkNames.map((n) => `[[${n}]]`).join(", ")}\n`;
   md += `**Date:** ${timestamp}${filterLine}\n`;
   md += `**Total Cases:** ${countLeafTestCases(testCases)}\n\n`;
   md += "---\n\n";
@@ -492,6 +503,136 @@ class FolderSuggestModal extends SuggestModal<TFolder> {
   }
 }
 
+class FileSelectModal extends Modal {
+  private selected: Set<string> = new Set();
+
+  constructor(
+    app: App,
+    private candidates: TFile[],
+    preselected: TFile[],
+    private onSubmit: (files: TFile[]) => void,
+    private onGoBack: (() => void) | null = null
+  ) {
+    super(app);
+    const candidatePaths = new Set(candidates.map((f) => f.path));
+    for (const f of preselected) {
+      if (candidatePaths.has(f.path)) this.selected.add(f.path);
+    }
+  }
+
+  onOpen() {
+    this.modalEl.addClass("qa-large-modal");
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h2", { text: "Select Test Files" });
+    contentEl.createEl("p", {
+      text: "Choose one or more files to include in this test run.",
+      cls: "mod-note",
+    });
+
+    const searchInput = contentEl.createEl("input", {
+      attr: { type: "text", placeholder: "Search files…" },
+      cls: "qa-tag-search",
+    }) as HTMLInputElement;
+
+    const counterEl = contentEl.createEl("p", { cls: "qa-review-counter" });
+    const updateCounter = () => {
+      counterEl.textContent = `${this.selected.size} file(s) selected`;
+    };
+    updateCounter();
+
+    const listEl = contentEl.createDiv({ cls: "qa-review-list" });
+    const rows: Array<{ file: TFile; row: HTMLElement }> = [];
+    const groupEls: Array<{ folder: string; header: HTMLElement; rows: HTMLElement[] }> = [];
+
+    // Group by folder so the vault's hierarchy stays visible instead of one flat path list
+    const byFolder = new Map<string, TFile[]>();
+    for (const file of this.candidates) {
+      const folder = file.parent?.path ?? "";
+      if (!byFolder.has(folder)) byFolder.set(folder, []);
+      byFolder.get(folder)!.push(file);
+    }
+    const sortedFolders = Array.from(byFolder.keys()).sort((a, b) => a.localeCompare(b));
+
+    for (const folder of sortedFolders) {
+      const files = byFolder.get(folder)!.sort((a, b) => a.basename.localeCompare(b.basename));
+      const header = listEl.createDiv({ cls: "qa-review-section-heading" });
+      header.style.paddingLeft = "10px";
+      header.createEl("span", { text: folder || "/", cls: "qa-review-heading-text" });
+      const groupRowEls: HTMLElement[] = [];
+
+      for (const file of files) {
+        const row = listEl.createDiv({ cls: "qa-review-item" });
+        row.style.paddingLeft = "24px";
+        const cb = row.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
+        cb.checked = this.selected.has(file.path);
+        cb.addEventListener("change", () => {
+          if (cb.checked) this.selected.add(file.path);
+          else this.selected.delete(file.path);
+          updateCounter();
+        });
+
+        const label = row.createEl("label");
+        label.style.cursor = "pointer";
+        label.style.marginLeft = "6px";
+        label.createSpan({ text: file.basename });
+        label.addEventListener("click", (e) => {
+          e.preventDefault();
+          cb.checked = !cb.checked;
+          cb.dispatchEvent(new Event("change"));
+        });
+
+        rows.push({ file, row });
+        groupRowEls.push(row);
+      }
+
+      groupEls.push({ folder, header, rows: groupRowEls });
+    }
+
+    if (this.candidates.length === 0) {
+      contentEl.createEl("p", { text: "No markdown files found in vault.", cls: "mod-note" });
+    }
+
+    searchInput.addEventListener("input", () => {
+      const query = searchInput.value.toLowerCase().trim();
+      rows.forEach(({ file, row }) => {
+        row.style.display = !query || file.path.toLowerCase().includes(query) ? "" : "none";
+      });
+      groupEls.forEach(({ header, rows: groupRows }) => {
+        const anyVisible = groupRows.some((r) => r.style.display !== "none");
+        header.style.display = anyVisible ? "" : "none";
+      });
+    });
+
+    const setting = new Setting(contentEl);
+    if (this.onGoBack) {
+      setting.addButton((btn) => btn.setButtonText("← Back").onClick(() => {
+        this.close();
+        this.onGoBack!();
+      }));
+    }
+    setting.addButton((btn) =>
+      btn
+        .setButtonText("Next: Select Attributes →")
+        .setCta()
+        .onClick(() => {
+          if (this.selected.size === 0) {
+            new Notice("Select at least one file.");
+            return;
+          }
+          const chosen = this.candidates.filter((f) => this.selected.has(f.path));
+          this.close();
+          this.onSubmit(chosen);
+        })
+    );
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class TagSelectModal extends Modal {
   private tagStates: Map<string, TagState> = new Map();
   private chipElements: Map<string, HTMLElement> = new Map();
@@ -502,7 +643,8 @@ class TagSelectModal extends Modal {
     private suiteName: string,
     private callback: (includeTags: string[], excludeTags: string[]) => void,
     initialIncludeTags: string[] = [],
-    initialExcludeTags: string[] = []
+    initialExcludeTags: string[] = [],
+    private onBack: (() => void) | null = null
   ) {
     super(app);
     allTags.forEach((tag) => {
@@ -553,7 +695,14 @@ class TagSelectModal extends Modal {
       contentEl.createEl("p", { text: "No attributes found in this test suite.", cls: "mod-note" });
     }
 
-    new Setting(contentEl).addButton((btn) =>
+    const bottomSetting = new Setting(contentEl);
+    if (this.onBack) {
+      bottomSetting.addButton((btn) => btn.setButtonText("← Back").onClick(() => {
+        this.close();
+        this.onBack!();
+      }));
+    }
+    bottomSetting.addButton((btn) =>
       btn
         .setButtonText("Next: Review Tests →")
         .setCta()
@@ -982,12 +1131,8 @@ export default class TMSPlugin extends Plugin {
     this.addCommand({
       id: "generate-test-run-current",
       name: "Test Run",
-      checkCallback: (checking) => {
-        const file = this.app.workspace.getActiveFile();
-        if (!file) return false;
-        if (checking) return true;
-        this.openTestRunFlow(file);
-        return true;
+      callback: () => {
+        this.openTestRunEntry(this.app.workspace.getActiveFile());
       },
     });
 
@@ -1036,9 +1181,7 @@ export default class TMSPlugin extends Plugin {
 
     // Ribbon icons
     this.ribbonTestRun = this.addRibbonIcon("test-tube", "Test Run", () => {
-      const file = this.app.workspace.getActiveFile();
-      if (file) this.openTestRunFlow(file);
-      else new Notice("No active file open.");
+      this.openTestRunEntry(this.app.workspace.getActiveFile());
     });
     this.ribbonResults = this.addRibbonIcon("bar-chart", "Results", () => {
       this.calculateTestResults();
@@ -1120,9 +1263,7 @@ export default class TMSPlugin extends Plugin {
     this.statusBarTestRun.setAttribute("title", "Test Run");
     this.statusBarTestRun.textContent = "🧪 Test Run";
     this.statusBarTestRun.addEventListener("click", () => {
-      const file = this.app.workspace.getActiveFile();
-      if (file) this.openTestRunFlow(file);
-      else new Notice("No active file open.");
+      this.openTestRunEntry(this.app.workspace.getActiveFile());
     });
 
     this.statusBarResults = this.addStatusBarItem();
@@ -1233,13 +1374,28 @@ export default class TMSPlugin extends Plugin {
 
   // ─── Folder helpers ────────────────────────────────────────────────────────
 
-  private getRunsFolder(suiteName: string): string {
+  /** Where to save a new test run / find its dashboard. No suite-specific
+   *  subfolder is auto-created: use the configured Base folder, or fall back
+   *  to Obsidian's own "default location for new notes" setting. */
+  private getRunsFolder(sourcePath: string): string {
     const base = this.settings.defaultTestRunFolder.trim().replace(/\/+$/, "");
-    return base ? `${base}/${suiteName} Test Runs` : `${suiteName} Test Runs`;
+    if (base) return base;
+    try {
+      const folder = this.app.fileManager.getNewFileParent(sourcePath);
+      return folder.isRoot() ? "" : folder.path;
+    } catch {
+      return "";
+    }
   }
 
   private getFolderPath(filePath: string): string {
     return filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
+  }
+
+  /** Joins a folder + filename without producing a leading slash when folder is "" or "/" (vault root). */
+  private joinPath(folder: string, name: string): string {
+    const normalized = folder.replace(/^\/+|\/+$/g, "");
+    return normalized ? `${normalized}/${name}` : name;
   }
 
   private countTestStatuses(content: string): Record<string, number> {
@@ -1262,8 +1418,9 @@ export default class TMSPlugin extends Plugin {
   }
 
   private async ensureFolder(path: string) {
-    if (!path) return;
-    const parts = path.split("/");
+    const normalized = path.replace(/^\/+|\/+$/g, "");
+    if (!normalized) return;
+    const parts = normalized.split("/");
     let current = "";
     for (const part of parts) {
       current = current ? `${current}/${part}` : part;
@@ -1318,136 +1475,205 @@ export default class TMSPlugin extends Plugin {
 
   // ─── Core flows ───────────────────────────────────────────────────────────
 
-  private async openTestRunFlow(file: TFile) {
-    // If opened from a test run file — find the original suite and pre-select existing cases
-    let suiteFile = file;
-    let preselectedNames: Set<string> | null = null;
-    let runCasesAll: TestCase[] = [];
-    let runTree: TestCase[] = [];
-
-    if (file.parent?.name.endsWith(" Test Runs")) {
-      const suiteName = file.parent.name.replace(/ Test Runs$/, "");
-      const found = this.app.vault.getFiles().find(
-        (f) => f.basename === suiteName && f.extension === "md"
-      );
-      if (!found) {
-        new Notice(`Suite "${suiteName}.md" not found. Open the test suite file directly.`);
-        return;
-      }
-      suiteFile = found;
-
-      // Parse the run body (strip header and stats section)
-      const runContent = await this.app.vault.read(file);
-      const runBody = runContent
-        .replace(/^[\s\S]*?(?=\n- \[)/, "")
-        .replace(STATS_SECTION_RE, "");
-      runTree = parseTestCases(runBody);
-
-      // Collect only actual checklist items
-      const flattenLeaves = (items: TestCase[], result: TestCase[]) => {
-        for (const tc of items) {
-          if (!tc.isHeading && tc.line.trim().match(/^-\s*\[/)) result.push(tc);
-          flattenLeaves(tc.children, result);
-        }
-      };
-      flattenLeaves(runTree, runCasesAll);
-
-      preselectedNames = new Set<string>();
-      for (const tc of runCasesAll) preselectedNames.add(tc.name.trim());
-    }
-
-    const content = await this.app.vault.read(suiteFile);
-    let testCases = parseTestCases(content);
-
-    // If opening from a run, find extras (cases in the run not in the suite) and append them
-    if (preselectedNames && runCasesAll.length > 0) {
-      const suiteNames = new Set<string>();
-      const collectSuiteNames = (items: TestCase[]) => {
-        for (const tc of items) {
-          if (!tc.isHeading) suiteNames.add(tc.name.trim());
-          collectSuiteNames(tc.children);
-        }
-      };
-      collectSuiteNames(testCases);
-
-      let extraIdx = 90000;
-      const buildExtrasTree = (items: TestCase[]): TestCase[] => {
-        const result: TestCase[] = [];
-        for (const tc of items) {
-          if (tc.isHeading) {
-            const extraChildren = buildExtrasTree(tc.children);
-            if (extraChildren.length > 0) {
-              result.push({ ...tc, children: extraChildren, hasChildren: true, lineNumber: extraIdx++, isManuallyAdded: true });
-            }
-          } else if (!suiteNames.has(tc.name.trim()) && tc.line.trim().match(/^-\s*\[/)) {
-            result.push({ ...tc, lineNumber: extraIdx++, isManuallyAdded: true });
-          }
-        }
-        return result;
-      };
-      const extrasTree = buildExtrasTree(runTree);
-      if (extrasTree.length > 0) {
-        // Add extras' names to preselectedNames
-        const collectExtrasFlat = (items: TestCase[]) => {
-          for (const tc of items) {
-            if (!tc.isHeading) preselectedNames!.add(tc.name.trim());
-            collectExtrasFlat(tc.children);
-          }
-        };
-        collectExtrasFlat(extrasTree);
-
-        const separator: TestCase = {
-          line: "",
-          name: "__manually_added_separator__",
-          tags: [],
-          lineNumber: 89998,
-          indent: 0,
-          children: [],
-          hasChildren: false,
-          isHeading: true,
-          headingLevel: 2,
-          isManuallyAdded: true,
-        };
-        testCases = [...testCases, separator, ...extrasTree];
-      }
-    }
-
-    if (testCases.length === 0) {
-      new Notice("No test cases found in this file.");
+  /** Entry point for the Test Run button/command/ribbon — decides between the
+   *  single-file re-run flow (unchanged) and the multi-file selection flow. */
+  private async openTestRunEntry(activeFile: TFile | null) {
+    if (activeFile?.parent?.name.endsWith(" Test Runs")) {
+      await this.openTestRunFlow([activeFile]);
       return;
     }
 
+    this.showFileSelectModal(activeFile ? [activeFile] : [], (selectedFiles) => this.openTestRunFlow(selectedFiles));
+  }
+
+  private showFileSelectModal(
+    preselected: TFile[],
+    onChosen: (files: TFile[]) => void,
+    onGoBack: (() => void) | null = null
+  ) {
+    const candidates = this.app.vault.getMarkdownFiles().sort((a, b) => a.path.localeCompare(b.path));
+    new FileSelectModal(this.app, candidates, preselected, onChosen, onGoBack).open();
+  }
+
+  private async openTestRunFlow(files: TFile[]) {
+    let preselectedNames: Set<string> | null = null;
+    let testCases: TestCase[];
+    let suiteName: string;
+    let suiteLinkNames: string[];
+
+    if (files.length === 1) {
+      // If opened from a test run file — find the original suite and pre-select existing cases
+      const file = files[0];
+      let suiteFile = file;
+      let runCasesAll: TestCase[] = [];
+      let runTree: TestCase[] = [];
+
+      if (file.parent?.name.endsWith(" Test Runs")) {
+        const suiteNameFromFolder = file.parent.name.replace(/ Test Runs$/, "");
+        const found = this.app.vault.getFiles().find(
+          (f) => f.basename === suiteNameFromFolder && f.extension === "md"
+        );
+        if (!found) {
+          new Notice(`Suite "${suiteNameFromFolder}.md" not found. Open the test suite file directly.`);
+          return;
+        }
+        suiteFile = found;
+
+        // Parse the run body (strip header and stats section)
+        const runContent = await this.app.vault.read(file);
+        const runBody = runContent
+          .replace(/^[\s\S]*?(?=\n- \[)/, "")
+          .replace(STATS_SECTION_RE, "");
+        runTree = parseTestCases(runBody);
+
+        // Collect only actual checklist items
+        const flattenLeaves = (items: TestCase[], result: TestCase[]) => {
+          for (const tc of items) {
+            if (!tc.isHeading && tc.line.trim().match(/^-\s*\[/)) result.push(tc);
+            flattenLeaves(tc.children, result);
+          }
+        };
+        flattenLeaves(runTree, runCasesAll);
+
+        preselectedNames = new Set<string>();
+        for (const tc of runCasesAll) preselectedNames.add(tc.name.trim());
+      }
+
+      const content = await this.app.vault.read(suiteFile);
+      testCases = parseTestCases(content);
+
+      // If opening from a run, find extras (cases in the run not in the suite) and append them
+      if (preselectedNames && runCasesAll.length > 0) {
+        const suiteNames = new Set<string>();
+        const collectSuiteNames = (items: TestCase[]) => {
+          for (const tc of items) {
+            if (!tc.isHeading) suiteNames.add(tc.name.trim());
+            collectSuiteNames(tc.children);
+          }
+        };
+        collectSuiteNames(testCases);
+
+        let extraIdx = 90000;
+        const buildExtrasTree = (items: TestCase[]): TestCase[] => {
+          const result: TestCase[] = [];
+          for (const tc of items) {
+            if (tc.isHeading) {
+              const extraChildren = buildExtrasTree(tc.children);
+              if (extraChildren.length > 0) {
+                result.push({ ...tc, children: extraChildren, hasChildren: true, lineNumber: extraIdx++, isManuallyAdded: true });
+              }
+            } else if (!suiteNames.has(tc.name.trim()) && tc.line.trim().match(/^-\s*\[/)) {
+              result.push({ ...tc, lineNumber: extraIdx++, isManuallyAdded: true });
+            }
+          }
+          return result;
+        };
+        const extrasTree = buildExtrasTree(runTree);
+        if (extrasTree.length > 0) {
+          // Add extras' names to preselectedNames
+          const collectExtrasFlat = (items: TestCase[]) => {
+            for (const tc of items) {
+              if (!tc.isHeading) preselectedNames!.add(tc.name.trim());
+              collectExtrasFlat(tc.children);
+            }
+          };
+          collectExtrasFlat(extrasTree);
+
+          const separator: TestCase = {
+            line: "",
+            name: "__manually_added_separator__",
+            tags: [],
+            lineNumber: 89998,
+            indent: 0,
+            children: [],
+            hasChildren: false,
+            isHeading: true,
+            headingLevel: 2,
+            isManuallyAdded: true,
+          };
+          testCases = [...testCases, separator, ...extrasTree];
+        }
+      }
+
+      if (testCases.length === 0) {
+        new Notice("No test cases found in this file.");
+        return;
+      }
+
+      suiteName = suiteFile.basename;
+      suiteLinkNames = [suiteName];
+    } else {
+      // Multiple files selected — group each file's cases under a heading named after the file,
+      // so the source file names stay visible in the review modal and the generated run.
+      const grouped: TestCase[] = [];
+      const namesUsed: string[] = [];
+
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        const content = await this.app.vault.read(f);
+        const parsed = parseTestCases(content);
+        if (parsed.length === 0) continue;
+
+        const offset = (i + 1) * 1_000_000;
+        grouped.push({
+          line: "",
+          name: f.basename,
+          tags: [],
+          lineNumber: offset,
+          indent: 0,
+          children: offsetLineNumbers(parsed, offset),
+          hasChildren: true,
+          isHeading: true,
+          headingLevel: 2,
+        });
+        namesUsed.push(f.basename);
+      }
+
+      if (grouped.length === 0) {
+        new Notice("No test cases found in the selected files.");
+        return;
+      }
+
+      testCases = grouped;
+      suiteLinkNames = namesUsed;
+      suiteName = namesUsed.join(" + ");
+    }
+
     const allTags = getAllTags(testCases);
-    const suiteName = suiteFile.basename;
     const hasPlaywright = !!this.settings.playwrightProjectPath.trim();
 
     const createRunFile = async (selectedCases: TestCase[], includeTags: string[], excludeTags: string[]) => {
-      const checklist = generateChecklist(selectedCases, suiteName, includeTags, excludeTags);
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const runFileName = `${suiteName} - Test Run ${timestamp}.md`;
-      const runsFolder = this.getRunsFolder(suiteName);
+      try {
+        const checklist = generateChecklist(selectedCases, suiteName, suiteLinkNames, includeTags, excludeTags);
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const runFileName = `${suiteName} - Test Run ${timestamp}.md`;
+        const runsFolder = this.getRunsFolder(files[0].path);
 
-      await this.ensureFolder(runsFolder);
+        await this.ensureFolder(runsFolder);
 
-      const dashPath = `${runsFolder}/Dashboard.md`;
-      if (this.settings.enableDashboard && !this.app.vault.getAbstractFileByPath(dashPath)) {
-        await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
+        const dashPath = this.joinPath(runsFolder, "Dashboard.md");
+        if (this.settings.enableDashboard && !this.app.vault.getAbstractFileByPath(dashPath)) {
+          await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
+        }
+
+        const runPath = this.joinPath(runsFolder, runFileName);
+        const runFile = await this.app.vault.create(runPath, checklist);
+
+        if (this.settings.enableDashboard) {
+          const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
+          if (dashFile instanceof TFile) await this.regenerateDashboard(dashFile);
+        }
+
+        const leaf = this.app.workspace.getLeaf();
+        if (!leaf) { new Notice("Could not open file."); return { runFile, checklist }; }
+        await leaf.openFile(runFile);
+        new Notice(`Test Run created: ${runPath}`);
+
+        return { runFile, checklist };
+      } catch (err) {
+        new Notice(`Failed to create Test Run: ${(err as Error).message}`);
+        throw err;
       }
-
-      const runPath = `${runsFolder}/${runFileName}`;
-      const runFile = await this.app.vault.create(runPath, checklist);
-
-      if (this.settings.enableDashboard) {
-        const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
-        if (dashFile instanceof TFile) await this.regenerateDashboard(dashFile);
-      }
-
-      const leaf = this.app.workspace.getLeaf();
-      if (!leaf) { new Notice("Could not open file."); return { runFile, checklist }; }
-      await leaf.openFile(runFile);
-      new Notice(`Test Run created: ${runPath}`);
-
-      return { runFile, checklist };
     };
 
     const openTagSelect = (prevInclude: string[] = [], prevExclude: string[] = []) => {
@@ -1478,7 +1704,9 @@ export default class TMSPlugin extends Plugin {
               }
             : null
         ).open();
-      }, prevInclude, prevExclude).open();
+      }, prevInclude, prevExclude, () => {
+        this.showFileSelectModal(files, (newFiles) => this.openTestRunFlow(newFiles));
+      }).open();
     };
 
     openTagSelect();
@@ -1592,10 +1820,9 @@ export default class TMSPlugin extends Plugin {
       }
     }
 
-    // On a test suite file — navigate to its runs folder Dashboard
-    const suiteName = file.basename;
-    const runsFolder = this.getRunsFolder(suiteName);
-    const dashPath = `${runsFolder}/Dashboard.md`;
+    // On any other file — navigate to the runs folder Dashboard
+    const runsFolder = this.getRunsFolder(file.path);
+    const dashPath = this.joinPath(runsFolder, "Dashboard.md");
     const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
     if (dashFile instanceof TFile) {
       const leaf2 = this.app.workspace.getLeaf();
@@ -1752,7 +1979,7 @@ class TMSSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Base folder for test runs")
-      .setDesc("Test runs are saved inside '{Base folder}/{Suite name} Test Runs/'. Leave empty for vault root.")
+      .setDesc("All test runs and their Dashboard are saved directly in this folder. Leave empty to use Obsidian's default location for new notes.")
       .addText((text) => {
         text
           .setPlaceholder("e.g. QA")

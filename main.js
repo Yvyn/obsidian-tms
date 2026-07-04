@@ -181,7 +181,14 @@ function filterByNames(testCases, names) {
   }
   return result;
 }
-function generateChecklist(testCases, suiteName, includeTags, excludeTags) {
+function offsetLineNumbers(items, offset) {
+  return items.map((tc) => ({
+    ...tc,
+    lineNumber: tc.lineNumber + offset,
+    children: offsetLineNumbers(tc.children, offset)
+  }));
+}
+function generateChecklist(testCases, suiteName, suiteLinkNames, includeTags, excludeTags) {
   const timestamp = new Date().toLocaleString();
   let filterLine = "";
   if (includeTags.length > 0)
@@ -192,7 +199,8 @@ function generateChecklist(testCases, suiteName, includeTags, excludeTags) {
 **Exclude:** ${excludeTags.map((t) => `@${t}`).join(" ")}`;
   let md = `# Test Run: ${suiteName}
 `;
-  md += `**Test Suite:** [[${suiteName}]]
+  md += suiteLinkNames.length === 1 ? `**Test Suite:** [[${suiteLinkNames[0]}]]
+` : `**Test Suites:** ${suiteLinkNames.map((n) => `[[${n}]]`).join(", ")}
 `;
   md += `**Date:** ${timestamp}${filterLine}
 `;
@@ -450,12 +458,124 @@ var FolderSuggestModal = class extends import_obsidian.SuggestModal {
     this.callback(folder.path);
   }
 };
+var FileSelectModal = class extends import_obsidian.Modal {
+  constructor(app, candidates, preselected, onSubmit, onGoBack = null) {
+    super(app);
+    this.candidates = candidates;
+    this.onSubmit = onSubmit;
+    this.onGoBack = onGoBack;
+    this.selected = /* @__PURE__ */ new Set();
+    const candidatePaths = new Set(candidates.map((f) => f.path));
+    for (const f of preselected) {
+      if (candidatePaths.has(f.path))
+        this.selected.add(f.path);
+    }
+  }
+  onOpen() {
+    var _a, _b;
+    this.modalEl.addClass("qa-large-modal");
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Select Test Files" });
+    contentEl.createEl("p", {
+      text: "Choose one or more files to include in this test run.",
+      cls: "mod-note"
+    });
+    const searchInput = contentEl.createEl("input", {
+      attr: { type: "text", placeholder: "Search files\u2026" },
+      cls: "qa-tag-search"
+    });
+    const counterEl = contentEl.createEl("p", { cls: "qa-review-counter" });
+    const updateCounter = () => {
+      counterEl.textContent = `${this.selected.size} file(s) selected`;
+    };
+    updateCounter();
+    const listEl = contentEl.createDiv({ cls: "qa-review-list" });
+    const rows = [];
+    const groupEls = [];
+    const byFolder = /* @__PURE__ */ new Map();
+    for (const file of this.candidates) {
+      const folder = (_b = (_a = file.parent) == null ? void 0 : _a.path) != null ? _b : "";
+      if (!byFolder.has(folder))
+        byFolder.set(folder, []);
+      byFolder.get(folder).push(file);
+    }
+    const sortedFolders = Array.from(byFolder.keys()).sort((a, b) => a.localeCompare(b));
+    for (const folder of sortedFolders) {
+      const files = byFolder.get(folder).sort((a, b) => a.basename.localeCompare(b.basename));
+      const header = listEl.createDiv({ cls: "qa-review-section-heading" });
+      header.style.paddingLeft = "10px";
+      header.createEl("span", { text: folder || "/", cls: "qa-review-heading-text" });
+      const groupRowEls = [];
+      for (const file of files) {
+        const row = listEl.createDiv({ cls: "qa-review-item" });
+        row.style.paddingLeft = "24px";
+        const cb = row.createEl("input", { attr: { type: "checkbox" } });
+        cb.checked = this.selected.has(file.path);
+        cb.addEventListener("change", () => {
+          if (cb.checked)
+            this.selected.add(file.path);
+          else
+            this.selected.delete(file.path);
+          updateCounter();
+        });
+        const label = row.createEl("label");
+        label.style.cursor = "pointer";
+        label.style.marginLeft = "6px";
+        label.createSpan({ text: file.basename });
+        label.addEventListener("click", (e) => {
+          e.preventDefault();
+          cb.checked = !cb.checked;
+          cb.dispatchEvent(new Event("change"));
+        });
+        rows.push({ file, row });
+        groupRowEls.push(row);
+      }
+      groupEls.push({ folder, header, rows: groupRowEls });
+    }
+    if (this.candidates.length === 0) {
+      contentEl.createEl("p", { text: "No markdown files found in vault.", cls: "mod-note" });
+    }
+    searchInput.addEventListener("input", () => {
+      const query = searchInput.value.toLowerCase().trim();
+      rows.forEach(({ file, row }) => {
+        row.style.display = !query || file.path.toLowerCase().includes(query) ? "" : "none";
+      });
+      groupEls.forEach(({ header, rows: groupRows }) => {
+        const anyVisible = groupRows.some((r) => r.style.display !== "none");
+        header.style.display = anyVisible ? "" : "none";
+      });
+    });
+    const setting = new import_obsidian.Setting(contentEl);
+    if (this.onGoBack) {
+      setting.addButton((btn) => btn.setButtonText("\u2190 Back").onClick(() => {
+        this.close();
+        this.onGoBack();
+      }));
+    }
+    setting.addButton(
+      (btn) => btn.setButtonText("Next: Select Attributes \u2192").setCta().onClick(() => {
+        if (this.selected.size === 0) {
+          new import_obsidian.Notice("Select at least one file.");
+          return;
+        }
+        const chosen = this.candidates.filter((f) => this.selected.has(f.path));
+        this.close();
+        this.onSubmit(chosen);
+      })
+    );
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
 var TagSelectModal = class extends import_obsidian.Modal {
-  constructor(app, allTags, suiteName, callback, initialIncludeTags = [], initialExcludeTags = []) {
+  constructor(app, allTags, suiteName, callback, initialIncludeTags = [], initialExcludeTags = [], onBack = null) {
     super(app);
     this.allTags = allTags;
     this.suiteName = suiteName;
     this.callback = callback;
+    this.onBack = onBack;
     this.tagStates = /* @__PURE__ */ new Map();
     this.chipElements = /* @__PURE__ */ new Map();
     allTags.forEach((tag) => {
@@ -501,7 +621,14 @@ var TagSelectModal = class extends import_obsidian.Modal {
     if (this.allTags.length === 0) {
       contentEl.createEl("p", { text: "No attributes found in this test suite.", cls: "mod-note" });
     }
-    new import_obsidian.Setting(contentEl).addButton(
+    const bottomSetting = new import_obsidian.Setting(contentEl);
+    if (this.onBack) {
+      bottomSetting.addButton((btn) => btn.setButtonText("\u2190 Back").onClick(() => {
+        this.close();
+        this.onBack();
+      }));
+    }
+    bottomSetting.addButton(
       (btn) => btn.setButtonText("Next: Review Tests \u2192").setCta().onClick(() => {
         const includeTags = this.allTags.filter((t) => this.tagStates.get(t) === "include");
         const excludeTags = this.allTags.filter((t) => this.tagStates.get(t) === "exclude");
@@ -880,14 +1007,8 @@ var TMSPlugin = class extends import_obsidian.Plugin {
     this.addCommand({
       id: "generate-test-run-current",
       name: "Test Run",
-      checkCallback: (checking) => {
-        const file = this.app.workspace.getActiveFile();
-        if (!file)
-          return false;
-        if (checking)
-          return true;
-        this.openTestRunFlow(file);
-        return true;
+      callback: () => {
+        this.openTestRunEntry(this.app.workspace.getActiveFile());
       }
     });
     this.addCommand({
@@ -935,11 +1056,7 @@ var TMSPlugin = class extends import_obsidian.Plugin {
       }
     });
     this.ribbonTestRun = this.addRibbonIcon("test-tube", "Test Run", () => {
-      const file = this.app.workspace.getActiveFile();
-      if (file)
-        this.openTestRunFlow(file);
-      else
-        new import_obsidian.Notice("No active file open.");
+      this.openTestRunEntry(this.app.workspace.getActiveFile());
     });
     this.ribbonResults = this.addRibbonIcon("bar-chart", "Results", () => {
       this.calculateTestResults();
@@ -1013,11 +1130,7 @@ var TMSPlugin = class extends import_obsidian.Plugin {
     this.statusBarTestRun.setAttribute("title", "Test Run");
     this.statusBarTestRun.textContent = "\u{1F9EA} Test Run";
     this.statusBarTestRun.addEventListener("click", () => {
-      const file = this.app.workspace.getActiveFile();
-      if (file)
-        this.openTestRunFlow(file);
-      else
-        new import_obsidian.Notice("No active file open.");
+      this.openTestRunEntry(this.app.workspace.getActiveFile());
     });
     this.statusBarResults = this.addStatusBarItem();
     this.statusBarResults.addClass("qa-status-bar-btn");
@@ -1115,12 +1228,27 @@ Failed to start process: ${err.message}
     });
   }
   // ─── Folder helpers ────────────────────────────────────────────────────────
-  getRunsFolder(suiteName) {
+  /** Where to save a new test run / find its dashboard. No suite-specific
+   *  subfolder is auto-created: use the configured Base folder, or fall back
+   *  to Obsidian's own "default location for new notes" setting. */
+  getRunsFolder(sourcePath) {
     const base = this.settings.defaultTestRunFolder.trim().replace(/\/+$/, "");
-    return base ? `${base}/${suiteName} Test Runs` : `${suiteName} Test Runs`;
+    if (base)
+      return base;
+    try {
+      const folder = this.app.fileManager.getNewFileParent(sourcePath);
+      return folder.isRoot() ? "" : folder.path;
+    } catch (e) {
+      return "";
+    }
   }
   getFolderPath(filePath) {
     return filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
+  }
+  /** Joins a folder + filename without producing a leading slash when folder is "" or "/" (vault root). */
+  joinPath(folder, name) {
+    const normalized = folder.replace(/^\/+|\/+$/g, "");
+    return normalized ? `${normalized}/${name}` : name;
   }
   countTestStatuses(content) {
     const counts = { pass: 0, fail: 0, skipped: 0, blocked: 0, notrun: 0 };
@@ -1142,9 +1270,10 @@ Failed to start process: ${err.message}
     return this.getFolderPath(sourceFilePath) ? `${this.getFolderPath(sourceFilePath)}/${bugName}.md` : `${bugName}.md`;
   }
   async ensureFolder(path) {
-    if (!path)
+    const normalized = path.replace(/^\/+|\/+$/g, "");
+    if (!normalized)
       return;
-    const parts = path.split("/");
+    const parts = normalized.split("/");
     let current = "";
     for (const part of parts) {
       current = current ? `${current}/${part}` : part;
@@ -1200,121 +1329,177 @@ Failed to start process: ${err.message}
     }
   }
   // ─── Core flows ───────────────────────────────────────────────────────────
-  async openTestRunFlow(file) {
+  /** Entry point for the Test Run button/command/ribbon — decides between the
+   *  single-file re-run flow (unchanged) and the multi-file selection flow. */
+  async openTestRunEntry(activeFile) {
     var _a;
-    let suiteFile = file;
-    let preselectedNames = null;
-    let runCasesAll = [];
-    let runTree = [];
-    if ((_a = file.parent) == null ? void 0 : _a.name.endsWith(" Test Runs")) {
-      const suiteName2 = file.parent.name.replace(/ Test Runs$/, "");
-      const found = this.app.vault.getFiles().find(
-        (f) => f.basename === suiteName2 && f.extension === "md"
-      );
-      if (!found) {
-        new import_obsidian.Notice(`Suite "${suiteName2}.md" not found. Open the test suite file directly.`);
-        return;
-      }
-      suiteFile = found;
-      const runContent = await this.app.vault.read(file);
-      const runBody = runContent.replace(/^[\s\S]*?(?=\n- \[)/, "").replace(STATS_SECTION_RE, "");
-      runTree = parseTestCases(runBody);
-      const flattenLeaves = (items, result) => {
-        for (const tc of items) {
-          if (!tc.isHeading && tc.line.trim().match(/^-\s*\[/))
-            result.push(tc);
-          flattenLeaves(tc.children, result);
-        }
-      };
-      flattenLeaves(runTree, runCasesAll);
-      preselectedNames = /* @__PURE__ */ new Set();
-      for (const tc of runCasesAll)
-        preselectedNames.add(tc.name.trim());
-    }
-    const content = await this.app.vault.read(suiteFile);
-    let testCases = parseTestCases(content);
-    if (preselectedNames && runCasesAll.length > 0) {
-      const suiteNames = /* @__PURE__ */ new Set();
-      const collectSuiteNames = (items) => {
-        for (const tc of items) {
-          if (!tc.isHeading)
-            suiteNames.add(tc.name.trim());
-          collectSuiteNames(tc.children);
-        }
-      };
-      collectSuiteNames(testCases);
-      let extraIdx = 9e4;
-      const buildExtrasTree = (items) => {
-        const result = [];
-        for (const tc of items) {
-          if (tc.isHeading) {
-            const extraChildren = buildExtrasTree(tc.children);
-            if (extraChildren.length > 0) {
-              result.push({ ...tc, children: extraChildren, hasChildren: true, lineNumber: extraIdx++, isManuallyAdded: true });
-            }
-          } else if (!suiteNames.has(tc.name.trim()) && tc.line.trim().match(/^-\s*\[/)) {
-            result.push({ ...tc, lineNumber: extraIdx++, isManuallyAdded: true });
-          }
-        }
-        return result;
-      };
-      const extrasTree = buildExtrasTree(runTree);
-      if (extrasTree.length > 0) {
-        const collectExtrasFlat = (items) => {
-          for (const tc of items) {
-            if (!tc.isHeading)
-              preselectedNames.add(tc.name.trim());
-            collectExtrasFlat(tc.children);
-          }
-        };
-        collectExtrasFlat(extrasTree);
-        const separator = {
-          line: "",
-          name: "__manually_added_separator__",
-          tags: [],
-          lineNumber: 89998,
-          indent: 0,
-          children: [],
-          hasChildren: false,
-          isHeading: true,
-          headingLevel: 2,
-          isManuallyAdded: true
-        };
-        testCases = [...testCases, separator, ...extrasTree];
-      }
-    }
-    if (testCases.length === 0) {
-      new import_obsidian.Notice("No test cases found in this file.");
+    if ((_a = activeFile == null ? void 0 : activeFile.parent) == null ? void 0 : _a.name.endsWith(" Test Runs")) {
+      await this.openTestRunFlow([activeFile]);
       return;
     }
+    this.showFileSelectModal(activeFile ? [activeFile] : [], (selectedFiles) => this.openTestRunFlow(selectedFiles));
+  }
+  showFileSelectModal(preselected, onChosen, onGoBack = null) {
+    const candidates = this.app.vault.getMarkdownFiles().sort((a, b) => a.path.localeCompare(b.path));
+    new FileSelectModal(this.app, candidates, preselected, onChosen, onGoBack).open();
+  }
+  async openTestRunFlow(files) {
+    var _a;
+    let preselectedNames = null;
+    let testCases;
+    let suiteName;
+    let suiteLinkNames;
+    if (files.length === 1) {
+      const file = files[0];
+      let suiteFile = file;
+      let runCasesAll = [];
+      let runTree = [];
+      if ((_a = file.parent) == null ? void 0 : _a.name.endsWith(" Test Runs")) {
+        const suiteNameFromFolder = file.parent.name.replace(/ Test Runs$/, "");
+        const found = this.app.vault.getFiles().find(
+          (f) => f.basename === suiteNameFromFolder && f.extension === "md"
+        );
+        if (!found) {
+          new import_obsidian.Notice(`Suite "${suiteNameFromFolder}.md" not found. Open the test suite file directly.`);
+          return;
+        }
+        suiteFile = found;
+        const runContent = await this.app.vault.read(file);
+        const runBody = runContent.replace(/^[\s\S]*?(?=\n- \[)/, "").replace(STATS_SECTION_RE, "");
+        runTree = parseTestCases(runBody);
+        const flattenLeaves = (items, result) => {
+          for (const tc of items) {
+            if (!tc.isHeading && tc.line.trim().match(/^-\s*\[/))
+              result.push(tc);
+            flattenLeaves(tc.children, result);
+          }
+        };
+        flattenLeaves(runTree, runCasesAll);
+        preselectedNames = /* @__PURE__ */ new Set();
+        for (const tc of runCasesAll)
+          preselectedNames.add(tc.name.trim());
+      }
+      const content = await this.app.vault.read(suiteFile);
+      testCases = parseTestCases(content);
+      if (preselectedNames && runCasesAll.length > 0) {
+        const suiteNames = /* @__PURE__ */ new Set();
+        const collectSuiteNames = (items) => {
+          for (const tc of items) {
+            if (!tc.isHeading)
+              suiteNames.add(tc.name.trim());
+            collectSuiteNames(tc.children);
+          }
+        };
+        collectSuiteNames(testCases);
+        let extraIdx = 9e4;
+        const buildExtrasTree = (items) => {
+          const result = [];
+          for (const tc of items) {
+            if (tc.isHeading) {
+              const extraChildren = buildExtrasTree(tc.children);
+              if (extraChildren.length > 0) {
+                result.push({ ...tc, children: extraChildren, hasChildren: true, lineNumber: extraIdx++, isManuallyAdded: true });
+              }
+            } else if (!suiteNames.has(tc.name.trim()) && tc.line.trim().match(/^-\s*\[/)) {
+              result.push({ ...tc, lineNumber: extraIdx++, isManuallyAdded: true });
+            }
+          }
+          return result;
+        };
+        const extrasTree = buildExtrasTree(runTree);
+        if (extrasTree.length > 0) {
+          const collectExtrasFlat = (items) => {
+            for (const tc of items) {
+              if (!tc.isHeading)
+                preselectedNames.add(tc.name.trim());
+              collectExtrasFlat(tc.children);
+            }
+          };
+          collectExtrasFlat(extrasTree);
+          const separator = {
+            line: "",
+            name: "__manually_added_separator__",
+            tags: [],
+            lineNumber: 89998,
+            indent: 0,
+            children: [],
+            hasChildren: false,
+            isHeading: true,
+            headingLevel: 2,
+            isManuallyAdded: true
+          };
+          testCases = [...testCases, separator, ...extrasTree];
+        }
+      }
+      if (testCases.length === 0) {
+        new import_obsidian.Notice("No test cases found in this file.");
+        return;
+      }
+      suiteName = suiteFile.basename;
+      suiteLinkNames = [suiteName];
+    } else {
+      const grouped = [];
+      const namesUsed = [];
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        const content = await this.app.vault.read(f);
+        const parsed = parseTestCases(content);
+        if (parsed.length === 0)
+          continue;
+        const offset = (i + 1) * 1e6;
+        grouped.push({
+          line: "",
+          name: f.basename,
+          tags: [],
+          lineNumber: offset,
+          indent: 0,
+          children: offsetLineNumbers(parsed, offset),
+          hasChildren: true,
+          isHeading: true,
+          headingLevel: 2
+        });
+        namesUsed.push(f.basename);
+      }
+      if (grouped.length === 0) {
+        new import_obsidian.Notice("No test cases found in the selected files.");
+        return;
+      }
+      testCases = grouped;
+      suiteLinkNames = namesUsed;
+      suiteName = namesUsed.join(" + ");
+    }
     const allTags = getAllTags(testCases);
-    const suiteName = suiteFile.basename;
     const hasPlaywright = !!this.settings.playwrightProjectPath.trim();
     const createRunFile = async (selectedCases, includeTags, excludeTags) => {
-      const checklist = generateChecklist(selectedCases, suiteName, includeTags, excludeTags);
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const runFileName = `${suiteName} - Test Run ${timestamp}.md`;
-      const runsFolder = this.getRunsFolder(suiteName);
-      await this.ensureFolder(runsFolder);
-      const dashPath = `${runsFolder}/Dashboard.md`;
-      if (this.settings.enableDashboard && !this.app.vault.getAbstractFileByPath(dashPath)) {
-        await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
-      }
-      const runPath = `${runsFolder}/${runFileName}`;
-      const runFile = await this.app.vault.create(runPath, checklist);
-      if (this.settings.enableDashboard) {
-        const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
-        if (dashFile instanceof import_obsidian.TFile)
-          await this.regenerateDashboard(dashFile);
-      }
-      const leaf = this.app.workspace.getLeaf();
-      if (!leaf) {
-        new import_obsidian.Notice("Could not open file.");
+      try {
+        const checklist = generateChecklist(selectedCases, suiteName, suiteLinkNames, includeTags, excludeTags);
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const runFileName = `${suiteName} - Test Run ${timestamp}.md`;
+        const runsFolder = this.getRunsFolder(files[0].path);
+        await this.ensureFolder(runsFolder);
+        const dashPath = this.joinPath(runsFolder, "Dashboard.md");
+        if (this.settings.enableDashboard && !this.app.vault.getAbstractFileByPath(dashPath)) {
+          await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
+        }
+        const runPath = this.joinPath(runsFolder, runFileName);
+        const runFile = await this.app.vault.create(runPath, checklist);
+        if (this.settings.enableDashboard) {
+          const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
+          if (dashFile instanceof import_obsidian.TFile)
+            await this.regenerateDashboard(dashFile);
+        }
+        const leaf = this.app.workspace.getLeaf();
+        if (!leaf) {
+          new import_obsidian.Notice("Could not open file.");
+          return { runFile, checklist };
+        }
+        await leaf.openFile(runFile);
+        new import_obsidian.Notice(`Test Run created: ${runPath}`);
         return { runFile, checklist };
+      } catch (err) {
+        new import_obsidian.Notice(`Failed to create Test Run: ${err.message}`);
+        throw err;
       }
-      await leaf.openFile(runFile);
-      new import_obsidian.Notice(`Test Run created: ${runPath}`);
-      return { runFile, checklist };
     };
     const openTagSelect = (prevInclude = [], prevExclude = []) => {
       new TagSelectModal(this.app, allTags, suiteName, (includeTags, excludeTags) => {
@@ -1341,7 +1526,9 @@ Failed to start process: ${err.message}
             this.runPlaywrightTests(runFile, ids);
           } : null
         ).open();
-      }, prevInclude, prevExclude).open();
+      }, prevInclude, prevExclude, () => {
+        this.showFileSelectModal(files, (newFiles) => this.openTestRunFlow(newFiles));
+      }).open();
     };
     openTagSelect();
   }
@@ -1458,9 +1645,8 @@ ${rows.join("\n")}
         return;
       }
     }
-    const suiteName = file.basename;
-    const runsFolder = this.getRunsFolder(suiteName);
-    const dashPath = `${runsFolder}/Dashboard.md`;
+    const runsFolder = this.getRunsFolder(file.path);
+    const dashPath = this.joinPath(runsFolder, "Dashboard.md");
     const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
     if (dashFile instanceof import_obsidian.TFile) {
       const leaf2 = this.app.workspace.getLeaf();
@@ -1596,7 +1782,7 @@ var TMSSettingTab = class extends import_obsidian.PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "Test Management System Settings" });
     containerEl.createEl("h3", { text: "Storage" });
-    new import_obsidian.Setting(containerEl).setName("Base folder for test runs").setDesc("Test runs are saved inside '{Base folder}/{Suite name} Test Runs/'. Leave empty for vault root.").addText((text) => {
+    new import_obsidian.Setting(containerEl).setName("Base folder for test runs").setDesc("All test runs and their Dashboard are saved directly in this folder. Leave empty to use Obsidian's default location for new notes.").addText((text) => {
       text.setPlaceholder("e.g. QA").setValue(this.plugin.settings.defaultTestRunFolder);
       text.inputEl.style.width = "200px";
       text.onChange(async (value) => {
