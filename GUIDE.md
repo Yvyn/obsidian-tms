@@ -134,6 +134,7 @@ A list of all test cases with sections. Cases matching the filter are pre-checke
 - Cases with nested items have a `▶` button to expand
 - Counter shows `N / Total selected`
 - **← Back** — return to attribute selection
+- **Test run file name** — editable field, defaults to `Test Run {date-time}`; change it if you want a different name
 - **Generate Test Run** — create the test run file
 
 **Section checkboxes:** each heading (`#`, `##`, `###`, etc.) has a checkbox that selects or deselects all test cases under it at once.
@@ -148,10 +149,11 @@ Headings are visually highlighted with a colored left border and bold text, scal
 
 ### Step 3 — Result
 
-A new `.md` file is created in the configured folder with the name:
+A new `.md` file is created in the configured folder. The default name is short and date-based so it never fails on long file names, even when the run was built from many source files:
 ```
-{File name} - Test Run {date-time}.md
+Test Run {date-time}.md
 ```
+You can edit this name in Step 2 before creating the run — the plugin sanitizes invalid characters and picks a `(2)`, `(3)`, … suffix automatically if a file with that name already exists. Renamed run files are still recognized by the Dashboard (it identifies them by content, not by file name).
 
 File structure:
 ```markdown

@@ -374,6 +374,21 @@ function parseSortKey(filename: string): string {
   return match ? match[0] : "";
 }
 
+/** Default run file name: short and date-based so it never hits OS filename
+ *  length limits, regardless of how many source files were selected. */
+function defaultRunFileName(): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  return `Test Run ${timestamp}`;
+}
+
+/** Strips characters illegal in file names and caps length as a safety net
+ *  for user-edited run names. */
+function sanitizeRunFileName(name: string): string {
+  const cleaned = name.replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim();
+  const capped = cleaned.length > 150 ? cleaned.slice(0, 150).trim() : cleaned;
+  return capped || defaultRunFileName();
+}
+
 function extractTmsIds(content: string): string[] {
   const seen = new Set<string>();
   const regex = /\(T(\d+)\)/gi;
@@ -543,52 +558,129 @@ class FileSelectModal extends Modal {
     updateCounter();
 
     const listEl = contentEl.createDiv({ cls: "qa-review-list" });
-    const rows: Array<{ file: TFile; row: HTMLElement }> = [];
-    const groupEls: Array<{ folder: string; header: HTMLElement; rows: HTMLElement[] }> = [];
+    const fileRows: Array<{ file: TFile; row: HTMLElement; cb: HTMLInputElement }> = [];
+    const folderGroups: Array<{ wrapper: HTMLElement; fileRows: HTMLElement[] }> = [];
+    const folderCheckboxes: Array<{ cb: HTMLInputElement; filePaths: string[] }> = [];
 
-    // Group by folder so the vault's hierarchy stays visible instead of one flat path list
-    const byFolder = new Map<string, TFile[]>();
-    for (const file of this.candidates) {
-      const folder = file.parent?.path ?? "";
-      if (!byFolder.has(folder)) byFolder.set(folder, []);
-      byFolder.get(folder)!.push(file);
+    // Build a folder tree so a whole folder (with all its nested subfolders)
+    // can be selected at once, instead of only picking individual files.
+    interface FolderNode {
+      name: string;
+      folders: Map<string, FolderNode>;
+      files: TFile[];
     }
-    const sortedFolders = Array.from(byFolder.keys()).sort((a, b) => a.localeCompare(b));
+    const root: FolderNode = { name: "", folders: new Map(), files: [] };
+    for (const file of this.candidates) {
+      const parts = file.parent?.path ? file.parent.path.split("/") : [];
+      let node = root;
+      for (const part of parts) {
+        let child = node.folders.get(part);
+        if (!child) {
+          child = { name: part, folders: new Map(), files: [] };
+          node.folders.set(part, child);
+        }
+        node = child;
+      }
+      node.files.push(file);
+    }
 
-    for (const folder of sortedFolders) {
-      const files = byFolder.get(folder)!.sort((a, b) => a.basename.localeCompare(b.basename));
-      const header = listEl.createDiv({ cls: "qa-review-section-heading" });
-      header.style.paddingLeft = "10px";
-      header.createEl("span", { text: folder || "/", cls: "qa-review-heading-text" });
-      const groupRowEls: HTMLElement[] = [];
+    const collectFiles = (node: FolderNode, out: TFile[] = []): TFile[] => {
+      out.push(...node.files);
+      for (const child of node.folders.values()) collectFiles(child, out);
+      return out;
+    };
 
-      for (const file of files) {
-        const row = listEl.createDiv({ cls: "qa-review-item" });
-        row.style.paddingLeft = "24px";
-        const cb = row.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
-        cb.checked = this.selected.has(file.path);
-        cb.addEventListener("change", () => {
-          if (cb.checked) this.selected.add(file.path);
-          else this.selected.delete(file.path);
+    const updateAllFolderCheckboxes = () => {
+      for (const { cb, filePaths } of folderCheckboxes) {
+        const checkedCount = filePaths.filter((p) => this.selected.has(p)).length;
+        cb.indeterminate = checkedCount > 0 && checkedCount < filePaths.length;
+        cb.checked = filePaths.length > 0 && checkedCount === filePaths.length;
+      }
+    };
+
+    const renderFile = (file: TFile, container: HTMLElement, depth: number) => {
+      const row = container.createDiv({ cls: "qa-review-item" });
+      row.style.paddingLeft = `${depth * 16 + 24}px`;
+      const cb = row.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
+      cb.checked = this.selected.has(file.path);
+      cb.addEventListener("change", () => {
+        if (cb.checked) this.selected.add(file.path);
+        else this.selected.delete(file.path);
+        updateAllFolderCheckboxes();
+        updateCounter();
+      });
+
+      const label = row.createEl("label");
+      label.style.cursor = "pointer";
+      label.style.marginLeft = "6px";
+      label.createSpan({ text: file.basename });
+      label.addEventListener("click", (e) => {
+        e.preventDefault();
+        cb.checked = !cb.checked;
+        cb.dispatchEvent(new Event("change"));
+      });
+
+      fileRows.push({ file, row, cb });
+    };
+
+    const renderNode = (node: FolderNode, container: HTMLElement, depth: number) => {
+      const subfolders = Array.from(node.folders.values()).sort((a, b) => a.name.localeCompare(b.name));
+      const files = [...node.files].sort((a, b) => a.basename.localeCompare(b.basename));
+
+      for (const sub of subfolders) {
+        const wrapper = container.createDiv();
+        const header = wrapper.createDiv({ cls: "qa-review-section-heading" });
+        header.style.paddingLeft = `${depth * 16 + 10}px`;
+        header.style.display = "flex";
+        header.style.alignItems = "center";
+
+        const folderCb = header.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
+
+        const toggle = header.createEl("span", { text: "▼" });
+        toggle.style.cursor = "pointer";
+        toggle.style.userSelect = "none";
+        toggle.style.margin = "0 4px";
+        toggle.style.color = "var(--text-muted)";
+
+        const label = header.createEl("span", { text: sub.name, cls: "qa-review-heading-text" });
+        label.style.cursor = "pointer";
+
+        const childrenEl = wrapper.createDiv();
+        let expanded = true;
+        const toggleExpanded = () => {
+          expanded = !expanded;
+          toggle.textContent = expanded ? "▼" : "▶";
+          childrenEl.style.display = expanded ? "" : "none";
+        };
+        toggle.addEventListener("click", toggleExpanded);
+        label.addEventListener("click", toggleExpanded);
+
+        const startIdx = fileRows.length;
+        renderNode(sub, childrenEl, depth + 1);
+        const descendantRows = fileRows.slice(startIdx).map((r) => r.row);
+        folderGroups.push({ wrapper, fileRows: descendantRows });
+
+        const allFiles = collectFiles(sub);
+        const allFilePaths = allFiles.map((f) => f.path);
+        folderCb.addEventListener("change", () => {
+          if (folderCb.checked) allFiles.forEach((f) => this.selected.add(f.path));
+          else allFiles.forEach((f) => this.selected.delete(f.path));
+          fileRows.forEach((ref) => {
+            if (allFilePaths.includes(ref.file.path)) ref.cb.checked = this.selected.has(ref.file.path);
+          });
+          updateAllFolderCheckboxes();
           updateCounter();
         });
-
-        const label = row.createEl("label");
-        label.style.cursor = "pointer";
-        label.style.marginLeft = "6px";
-        label.createSpan({ text: file.basename });
-        label.addEventListener("click", (e) => {
-          e.preventDefault();
-          cb.checked = !cb.checked;
-          cb.dispatchEvent(new Event("change"));
-        });
-
-        rows.push({ file, row });
-        groupRowEls.push(row);
+        folderCheckboxes.push({ cb: folderCb, filePaths: allFilePaths });
       }
 
-      groupEls.push({ folder, header, rows: groupRowEls });
-    }
+      for (const file of files) {
+        renderFile(file, container, depth);
+      }
+    };
+
+    renderNode(root, listEl, 0);
+    updateAllFolderCheckboxes();
 
     if (this.candidates.length === 0) {
       contentEl.createEl("p", { text: "No markdown files found in vault.", cls: "mod-note" });
@@ -596,12 +688,12 @@ class FileSelectModal extends Modal {
 
     searchInput.addEventListener("input", () => {
       const query = searchInput.value.toLowerCase().trim();
-      rows.forEach(({ file, row }) => {
+      fileRows.forEach(({ file, row }) => {
         row.style.display = !query || file.path.toLowerCase().includes(query) ? "" : "none";
       });
-      groupEls.forEach(({ header, rows: groupRows }) => {
-        const anyVisible = groupRows.some((r) => r.style.display !== "none");
-        header.style.display = anyVisible ? "" : "none";
+      folderGroups.forEach(({ wrapper, fileRows: rowsInFolder }) => {
+        const anyVisible = rowsInFolder.some((r) => r.style.display !== "none");
+        wrapper.style.display = anyVisible ? "" : "none";
       });
     });
 
@@ -756,9 +848,9 @@ class TestReviewModal extends Modal {
     filteredTestCases: TestCase[],
     private includeTags: string[],
     private excludeTags: string[],
-    private onManual: (selectedCases: TestCase[]) => void,
+    private onManual: (selectedCases: TestCase[], runName: string) => void,
     private onBack: () => void,
-    private onAuto: ((selectedCases: TestCase[]) => void) | null = null
+    private onAuto: ((selectedCases: TestCase[], runName: string) => void) | null = null
   ) {
     super(app);
     const addChecked = (items: TestCase[]) => {
@@ -789,6 +881,16 @@ class TestReviewModal extends Modal {
     } else {
       contentEl.createEl("p", { text: "No tag filter — all test cases shown.", cls: "mod-note" });
     }
+
+    let runName = defaultRunFileName();
+    new Setting(contentEl)
+      .setName("Test run file name")
+      .setDesc("Defaults to the date. Edit it if you'd like a different name.")
+      .addText((text) => {
+        text.setValue(runName);
+        text.inputEl.style.width = "100%";
+        text.onChange((value) => { runName = value; });
+      });
 
     const totalTestCount = countLeafTestCases(this.allTestCases);
     const counterEl = contentEl.createEl("p", { cls: "qa-review-counter" });
@@ -950,7 +1052,7 @@ class TestReviewModal extends Modal {
               new Notice("No test cases selected.");
               return;
             }
-            this.onManual(selected);
+            this.onManual(selected, sanitizeRunFileName(runName));
             this.close();
           })
       );
@@ -964,7 +1066,7 @@ class TestReviewModal extends Modal {
             new Notice("No test cases selected.");
             return;
           }
-          this.onAuto!(selected);
+          this.onAuto!(selected, sanitizeRunFileName(runName));
           this.close();
         });
         return btn;
@@ -1642,11 +1744,9 @@ export default class TMSPlugin extends Plugin {
     const allTags = getAllTags(testCases);
     const hasPlaywright = !!this.settings.playwrightProjectPath.trim();
 
-    const createRunFile = async (selectedCases: TestCase[], includeTags: string[], excludeTags: string[]) => {
+    const createRunFile = async (selectedCases: TestCase[], includeTags: string[], excludeTags: string[], runName: string) => {
       try {
         const checklist = generateChecklist(selectedCases, suiteName, suiteLinkNames, includeTags, excludeTags);
-        const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-        const runFileName = `${suiteName} - Test Run ${timestamp}.md`;
         const runsFolder = this.getRunsFolder(files[0].path);
 
         await this.ensureFolder(runsFolder);
@@ -1656,7 +1756,12 @@ export default class TMSPlugin extends Plugin {
           await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
         }
 
-        const runPath = this.joinPath(runsFolder, runFileName);
+        let runPath = this.joinPath(runsFolder, `${runName}.md`);
+        if (this.app.vault.getAbstractFileByPath(runPath)) {
+          let n = 2;
+          while (this.app.vault.getAbstractFileByPath(this.joinPath(runsFolder, `${runName} (${n}).md`))) n++;
+          runPath = this.joinPath(runsFolder, `${runName} (${n}).md`);
+        }
         const runFile = await this.app.vault.create(runPath, checklist);
 
         if (this.settings.enableDashboard) {
@@ -1688,13 +1793,13 @@ export default class TMSPlugin extends Plugin {
           preSelected,
           includeTags,
           excludeTags,
-          async (selectedCases: TestCase[]) => {
-            await createRunFile(selectedCases, includeTags, excludeTags);
+          async (selectedCases: TestCase[], runName: string) => {
+            await createRunFile(selectedCases, includeTags, excludeTags, runName);
           },
           () => openTagSelect(includeTags, excludeTags),
           hasPlaywright
-            ? async (selectedCases: TestCase[]) => {
-                const { runFile, checklist } = await createRunFile(selectedCases, includeTags, excludeTags);
+            ? async (selectedCases: TestCase[], runName: string) => {
+                const { runFile, checklist } = await createRunFile(selectedCases, includeTags, excludeTags, runName);
                 const ids = extractTmsIds(checklist);
                 if (ids.length === 0) {
                   new Notice("No TMS IDs (Txxx) found in test run — skipping automated run.");
@@ -1861,14 +1966,12 @@ export default class TMSPlugin extends Plugin {
   }
 
   private async buildDashboardContent(folder: TFolder, suiteName: string): Promise<string> {
-    const runFiles: TFile[] = folder.children
-      .filter(
-        (f): f is TFile =>
-          f instanceof TFile &&
-          f.name !== "Dashboard.md" &&
-          f.name.includes("- Test Run ")
-      )
-      .sort((a, b) => parseSortKey(a.name).localeCompare(parseSortKey(b.name)));
+    // Run files can be renamed by the user (see the editable file name field when
+    // creating a run), so they're identified by their content header rather than
+    // by matching a fixed filename pattern.
+    const candidateFiles: TFile[] = folder.children.filter(
+      (f): f is TFile => f instanceof TFile && f.extension === "md" && f.name !== "Dashboard.md"
+    );
 
     type RunData = {
       file: TFile;
@@ -1884,8 +1987,10 @@ export default class TMSPlugin extends Plugin {
     const runs: RunData[] = [];
     const allBugNames = new Set<string>();
 
-    for (const runFile of runFiles) {
+    for (const runFile of candidateFiles) {
       const content = await this.app.vault.cachedRead(runFile);
+      if (!content.startsWith("# Test Run:")) continue;
+
       const counts = this.countTestStatuses(content);
       const total = (Object.keys(counts) as string[]).reduce((a, k) => a + counts[k], 0);
       runs.push({
@@ -1905,6 +2010,8 @@ export default class TMSPlugin extends Plugin {
         allBugNames.add(bugName);
       }
     }
+
+    runs.sort((a, b) => parseSortKey(a.file.name).localeCompare(parseSortKey(b.file.name)));
 
     let md = `${DASHBOARD_MARKER}\n# ${suiteName} - Dashboard\n\n`;
     md += `> Auto-refreshes when opened.\n\n`;
