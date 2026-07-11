@@ -250,6 +250,13 @@ var STATUS_LABEL_MAP = {
   B: "\u{1F6AB} Blocked"
 };
 var EXISTING_LABEL_RE = /^(✅ Pass|❌ Fail|⏭️ Skipped|🚫 Blocked|🟢 Pass|🔴 Fail|🟡 Skipped|🟣 Blocked)( 📅 \d{4}-\d{2}-\d{2})? \| /;
+var BULK_STATUS_OPTIONS = [
+  { label: "Pass", char: "p", icon: "check" },
+  { label: "Fail", char: "f", icon: "x" },
+  { label: "Skipped", char: "s", icon: "skip-forward" },
+  { label: "Blocked", char: "b", icon: "ban" },
+  { label: "Not Run", char: " ", icon: "square" }
+];
 function applyStatusLabel(line) {
   const match = line.match(/^(- \[([^\]]+)\] )([^]*)/);
   if (!match)
@@ -326,6 +333,9 @@ function parseDateLabel(filename) {
   if (!match)
     return filename.replace(/\.md$/, "");
   return `${MONTHS[parseInt(match[2]) - 1]} ${parseInt(match[3])} ${match[4]}:${match[5]}`;
+}
+function naturalCompare(a, b) {
+  return a.localeCompare(b, void 0, { numeric: true, sensitivity: "base" });
 }
 function parseSortKey(filename) {
   const match = filename.match(/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}/);
@@ -467,6 +477,23 @@ var FolderSuggestModal = class extends import_obsidian.SuggestModal {
     this.callback(folder.path);
   }
 };
+var FileSuggestModal = class extends import_obsidian.SuggestModal {
+  constructor(app, callback) {
+    super(app);
+    this.callback = callback;
+    this.setPlaceholder("Type to search markdown files\u2026");
+  }
+  getSuggestions(query) {
+    const q = query.toLowerCase();
+    return this.app.vault.getMarkdownFiles().filter((f) => f.path.toLowerCase().includes(q));
+  }
+  renderSuggestion(file, el) {
+    el.createEl("div", { text: file.path });
+  }
+  onChooseSuggestion(file) {
+    this.callback(file.path);
+  }
+};
 var FileSelectModal = class extends import_obsidian.Modal {
   constructor(app, candidates, preselected, onSubmit, onGoBack = null) {
     super(app);
@@ -555,8 +582,8 @@ var FileSelectModal = class extends import_obsidian.Modal {
       fileRows.push({ file, row, cb });
     };
     const renderNode = (node, container, depth) => {
-      const subfolders = Array.from(node.folders.values()).sort((a, b) => a.name.localeCompare(b.name));
-      const files = [...node.files].sort((a, b) => a.basename.localeCompare(b.basename));
+      const subfolders = Array.from(node.folders.values()).sort((a, b) => naturalCompare(a.name, b.name));
+      const files = [...node.files].sort((a, b) => naturalCompare(a.basename, b.basename));
       for (const sub of subfolders) {
         const wrapper = container.createDiv();
         const header = wrapper.createDiv({ cls: "qa-review-section-heading" });
@@ -632,7 +659,7 @@ var FileSelectModal = class extends import_obsidian.Modal {
           new import_obsidian.Notice("Select at least one file.");
           return;
         }
-        const chosen = this.candidates.filter((f) => this.selected.has(f.path));
+        const chosen = fileRows.filter(({ file }) => this.selected.has(file.path)).map(({ file }) => file);
         this.close();
         this.onSubmit(chosen);
       })
@@ -1053,7 +1080,7 @@ var AttributeSuggest = class extends import_obsidian.EditorSuggest {
 var DEFAULT_SETTINGS = {
   defaultTestRunFolder: "",
   bugsFolder: "",
-  bugTemplate: "",
+  bugTemplatePath: "",
   enableDashboard: true,
   dashboardHiddenStatuses: "done",
   showRibbonTestRun: true,
@@ -1110,12 +1137,12 @@ var TMSPlugin = class extends import_obsidian.Plugin {
     this.addCommand({
       id: "insert-bug-template",
       name: "Insert Bug Template",
-      editorCallback: (editor) => {
+      editorCallback: async (editor) => {
         const file = this.app.workspace.getActiveFile();
         if (!file)
           return;
         const title = file.basename.startsWith("Bug - ") ? file.basename.replace(/^Bug - /, "") : file.basename;
-        const templateContent = this.bugTemplate(title);
+        const templateContent = await this.bugTemplate(title);
         if (!templateContent) {
           new import_obsidian.Notice("No bug template configured. Set one in plugin settings.");
           return;
@@ -1162,7 +1189,7 @@ var TMSPlugin = class extends import_obsidian.Plugin {
         if (hasUserContent)
           return;
         const title = abstractFile.basename.replace(/^Bug - /, "");
-        const templateContent = this.bugTemplate(title);
+        const templateContent = await this.bugTemplate(title);
         if (!templateContent && current.trim() === "")
           return;
         await this.app.vault.modify(abstractFile, templateContent);
@@ -1194,6 +1221,53 @@ var TMSPlugin = class extends import_obsidian.Plugin {
         this.processingFiles.add(abstractFile.path);
         await this.app.vault.modify(abstractFile, updated);
         setTimeout(() => this.processingFiles.delete(abstractFile.path), 300);
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("editor-menu", (menu, editor, info) => {
+        const file = info.file;
+        if (!file || file.name === "Dashboard.md")
+          return;
+        const selections = editor.listSelections();
+        const hasSelection = selections.some(
+          (s) => s.anchor.line !== s.head.line || s.anchor.ch !== s.head.ch
+        );
+        if (!hasSelection)
+          return;
+        let minLine = Infinity;
+        let maxLine = -Infinity;
+        for (const s of selections) {
+          minLine = Math.min(minLine, s.anchor.line, s.head.line);
+          maxLine = Math.max(maxLine, s.anchor.line, s.head.line);
+        }
+        const checklistLineRe = /^(\s*- )\[[^\]]*\](.*)$/;
+        let hasChecklistLine = false;
+        for (let i = minLine; i <= maxLine; i++) {
+          if (checklistLineRe.test(editor.getLine(i))) {
+            hasChecklistLine = true;
+            break;
+          }
+        }
+        if (!hasChecklistLine)
+          return;
+        menu.addSeparator();
+        for (const opt of BULK_STATUS_OPTIONS) {
+          menu.addItem(
+            (item) => item.setTitle(`Set status: ${opt.label}`).setIcon(opt.icon).onClick(() => {
+              const newLines = [];
+              for (let i = minLine; i <= maxLine; i++) {
+                const line = editor.getLine(i);
+                const match = line.match(checklistLineRe);
+                newLines.push(match ? applyStatusLabel(`${match[1]}[${opt.char}]${match[2]}`) : line);
+              }
+              editor.replaceRange(
+                newLines.join("\n"),
+                { line: minLine, ch: 0 },
+                { line: maxLine, ch: editor.getLine(maxLine).length }
+              );
+            })
+          );
+        }
       })
     );
     this.registerEvent(
@@ -1363,12 +1437,17 @@ Failed to start process: ${err.message}
       }
     }
   }
-  bugTemplate(title) {
-    const tpl = this.settings.bugTemplate.trim();
-    if (tpl) {
-      return tpl.replace(/\{\{title\}\}/g, title);
+  async bugTemplate(title) {
+    const path = this.settings.bugTemplatePath.trim();
+    if (!path)
+      return "";
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof import_obsidian.TFile)) {
+      new import_obsidian.Notice(`Bug template not found: ${path}`);
+      return "";
     }
-    return "";
+    const content = await this.app.vault.cachedRead(file);
+    return content.replace(/\{\{title\}\}/g, title);
   }
   async createBugFile(bugName, sourceFilePath) {
     const filePath = this.getBugFilePath(bugName, sourceFilePath);
@@ -1378,7 +1457,7 @@ Failed to start process: ${err.message}
     if (folder)
       await this.ensureFolder(folder);
     const title = bugName.replace(/^Bug - /, "");
-    await this.app.vault.create(filePath, this.bugTemplate(title));
+    await this.app.vault.create(filePath, await this.bugTemplate(title));
     new import_obsidian.Notice(`Bug created: ${bugName}`);
   }
   getBugStatus(bugName) {
@@ -1557,9 +1636,6 @@ Failed to start process: ${err.message}
         const runsFolder = this.getRunsFolder(files[0].path);
         await this.ensureFolder(runsFolder);
         const dashPath = this.joinPath(runsFolder, "Dashboard.md");
-        if (this.settings.enableDashboard && !this.app.vault.getAbstractFileByPath(dashPath)) {
-          await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
-        }
         let runPath = this.joinPath(runsFolder, `${runName}.md`);
         if (this.app.vault.getAbstractFileByPath(runPath)) {
           let n = 2;
@@ -1646,7 +1722,7 @@ Failed to start process: ${err.message}
           const folder = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "";
           if (folder)
             await this.ensureFolder(folder);
-          await this.app.vault.create(filePath, this.bugTemplate(title));
+          await this.app.vault.create(filePath, await this.bugTemplate(title));
           new import_obsidian.Notice(`Bug created: ${name}`);
         }
       }
@@ -1671,7 +1747,7 @@ Failed to start process: ${err.message}
         const folder = this.getFolderPath(filePath);
         if (folder)
           await this.ensureFolder(folder);
-        await this.app.vault.create(filePath, this.bugTemplate(title));
+        await this.app.vault.create(filePath, await this.bugTemplate(title));
         new import_obsidian.Notice(`Bug created: ${bugName}`);
         newFilesCreated = true;
       }
@@ -1717,32 +1793,14 @@ ${rows.join("\n")}
       new import_obsidian.Notice("Dashboard refreshed.");
       return;
     }
-    if ((_a = file.parent) == null ? void 0 : _a.name.endsWith(" Test Runs")) {
-      const dashPath2 = `${file.parent.path}/Dashboard.md`;
-      const dashFile2 = this.app.vault.getAbstractFileByPath(dashPath2);
-      if (dashFile2 instanceof import_obsidian.TFile) {
-        const leaf1 = this.app.workspace.getLeaf();
-        if (!leaf1) {
-          new import_obsidian.Notice("Could not open file.");
-          return;
-        }
-        await leaf1.openFile(dashFile2);
-        return;
-      }
+    const folderPath = ((_a = file.parent) == null ? void 0 : _a.name.endsWith(" Test Runs")) ? file.parent.path : this.getRunsFolder(file.path);
+    const dashFile = await this.getOrCreateDashboard(folderPath);
+    const leaf = this.app.workspace.getLeaf();
+    if (!leaf) {
+      new import_obsidian.Notice("Could not open file.");
+      return;
     }
-    const runsFolder = this.getRunsFolder(file.path);
-    const dashPath = this.joinPath(runsFolder, "Dashboard.md");
-    const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
-    if (dashFile instanceof import_obsidian.TFile) {
-      const leaf2 = this.app.workspace.getLeaf();
-      if (!leaf2) {
-        new import_obsidian.Notice("Could not open file.");
-        return;
-      }
-      await leaf2.openFile(dashFile);
-    } else {
-      new import_obsidian.Notice("No dashboard found. Create a test run first.");
-    }
+    await leaf.openFile(dashFile);
   }
   // ─── Dashboard ────────────────────────────────────────────────────────────
   buildEmptyDashboard(suiteName) {
@@ -1753,6 +1811,23 @@ ${rows.join("\n")}
 
 *No test runs yet. Create your first test run to see statistics.*
 `;
+  }
+  dashboardSuiteName(folderPath) {
+    if (!folderPath)
+      return this.app.vault.getName();
+    return (folderPath.split("/").pop() || folderPath).replace(/ Test Runs$/, "");
+  }
+  /** Dashboards are only created on demand (Dashboard button/command), never
+   *  as a side effect of generating a test run — see createRunFile above. */
+  async getOrCreateDashboard(folderPath) {
+    const dashPath = this.joinPath(folderPath, "Dashboard.md");
+    const existing = this.app.vault.getAbstractFileByPath(dashPath);
+    if (existing instanceof import_obsidian.TFile)
+      return existing;
+    await this.ensureFolder(folderPath);
+    const created = await this.app.vault.create(dashPath, this.buildEmptyDashboard(this.dashboardSuiteName(folderPath)));
+    await this.regenerateDashboard(created);
+    return created;
   }
   async regenerateDashboard(dashFile) {
     if (this.dashboardRefreshing)
@@ -1902,20 +1977,24 @@ var TMSSettingTab = class extends import_obsidian.PluginSettingTab {
         }).open();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Bug template").setDesc("Template for new bug pages. Use {{title}} as a placeholder for the bug title. Leave empty to create a blank file (Obsidian shows the filename as title).").addTextArea((ta) => {
-      ta.setPlaceholder(
-        "---\nstatus: New\ntags: [Bug]\n---\n\n# {{title}}\n\n## Description\n\n## Steps to Reproduce"
-      ).setValue(this.plugin.settings.bugTemplate);
-      ta.inputEl.style.width = "320px";
-      ta.inputEl.style.height = "140px";
-      ta.inputEl.style.fontFamily = "monospace";
-      ta.onChange(async (value) => {
-        this.plugin.settings.bugTemplate = value;
+    new import_obsidian.Setting(containerEl).setName("Bug template").setDesc("Path to a note used as the template for new bug pages. Edit that note like any other Obsidian file. Use {{title}} inside it as a placeholder for the bug title. Leave empty to create a blank file (Obsidian shows the filename as title).").addText((text) => {
+      text.setPlaceholder("e.g. Templates/Bug Report.md").setValue(this.plugin.settings.bugTemplatePath);
+      text.inputEl.style.width = "200px";
+      text.onChange(async (value) => {
+        this.plugin.settings.bugTemplatePath = value;
         await this.plugin.saveData(this.plugin.settings);
       });
-    });
+    }).addButton(
+      (btn) => btn.setButtonText("Browse\u2026").onClick(() => {
+        new FileSuggestModal(this.app, async (path) => {
+          this.plugin.settings.bugTemplatePath = path;
+          await this.plugin.saveData(this.plugin.settings);
+          this.display();
+        }).open();
+      })
+    );
     containerEl.createEl("h3", { text: "Dashboard" });
-    new import_obsidian.Setting(containerEl).setName("Enable Dashboard").setDesc("Auto-creates a Dashboard page in the test runs folder and refreshes it on open.").addToggle(
+    new import_obsidian.Setting(containerEl).setName("Enable Dashboard").setDesc("Keeps the Dashboard page (created on demand via the Dashboard button/command) up to date on open and after each new test run.").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.enableDashboard).onChange(async (value) => {
         this.plugin.settings.enableDashboard = value;
         await this.plugin.saveData(this.plugin.settings);

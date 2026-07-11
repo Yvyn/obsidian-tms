@@ -205,6 +205,8 @@ In the generated test run, replace `[ ]` with the case status:
 
 The label (`✅ Pass |`, `❌ Fail |`, etc.) is **added automatically** when the status changes — no manual input needed.
 
+**Setting many at once:** select several checklist lines with the mouse, right-click the selection, and choose **Set status: Pass / Fail / Skipped / Blocked / Not Run** from the context menu. All checklist lines in the selection get that status; other selected lines (headings, blank lines) are left alone.
+
 **Example:**
 ```markdown
 - [p] ✅ Pass | **Login with valid credentials** @smoke
@@ -247,7 +249,7 @@ The Bugs table appears in the results only when bugs are referenced:
 
 ### Bug template
 
-Set a template for new bug files in **Settings → Bug template**. Use `{{title}}` as a placeholder for the bug name:
+The bug template is a regular note in your vault — create it like any other file (e.g. `Templates/Bug Report.md`) and point **Settings → Bug template** at its path (or use **Browse…**). Use `{{title}}` inside that note as a placeholder for the bug name:
 
 ```
 ---
@@ -262,7 +264,7 @@ tags: [Bug]
 ## Steps to Reproduce
 ```
 
-When a bug file is created (via `!`, clicking an unresolved link, or the Results command), the template is applied automatically.
+When a bug file is created (via `!`, clicking an unresolved link, or the Results command), the plugin reads the template note's content and applies it automatically, substituting `{{title}}`.
 
 ### Insert Bug Template command
 
@@ -282,7 +284,7 @@ Set a dedicated folder for bug files in **Settings → Bugs folder**. When a bug
 
 ## 9. Dashboard
 
-The Dashboard is a summary page that auto-generates inside the test runs folder.
+The Dashboard is a summary page for a test runs folder. It is **not created automatically** when you generate a test run — create it on demand via the **Dashboard** command (command palette, ribbon, or status bar) the first time you want one for that folder. Once it exists, it keeps itself up to date automatically (see below).
 
 ### What it contains
 
@@ -291,7 +293,7 @@ The Dashboard is a summary page that auto-generates inside the test runs folder.
 
 ### Auto-refresh
 
-The Dashboard refreshes automatically every time you open it. You can also refresh it manually via the **Dashboard** command (command palette, ribbon, or status bar).
+Once created, the Dashboard refreshes automatically every time you open it, and whenever a new test run is generated in its folder. You can also refresh it manually via the **Dashboard** command (command palette, ribbon, or status bar).
 
 ### Hidden bug statuses
 
@@ -299,7 +301,7 @@ In **Settings → Hidden bug statuses**, enter a comma-separated list of statuse
 
 ### Enable / disable
 
-The Dashboard can be fully disabled in **Settings → Enable Dashboard**. When disabled, no Dashboard file is created and the Dashboard buttons are hidden.
+The Dashboard can be fully disabled in **Settings → Enable Dashboard**. When disabled, the Dashboard buttons are hidden and existing dashboards no longer auto-refresh.
 
 ---
 
@@ -377,13 +379,13 @@ Open **Settings → Test Management System**.
 |---------|-------------|
 | Base folder for test runs | Folder where `{Suite} Test Runs/` folders are created. Leave empty for vault root. |
 | Bugs folder | Folder where bug files are saved. Leave empty to save next to the test run. |
-| Bug template | Template applied to new bug files. Use `{{title}}` for the bug name. Leave empty for a blank file. |
+| Bug template | Path to a note used as the template for new bug files. Use `{{title}}` inside it for the bug name. Leave empty for a blank file. |
 
 ### Dashboard
 
 | Setting | Description |
 |---------|-------------|
-| Enable Dashboard | Auto-creates and refreshes the Dashboard page in each test runs folder. |
+| Enable Dashboard | Keeps an already-created Dashboard page up to date on open and after each new test run. Dashboards are created on demand via the Dashboard button/command, not automatically. |
 | Hidden bug statuses | Comma-separated statuses to hide from the Bugs table (e.g. `done, closed`). |
 
 ### Buttons

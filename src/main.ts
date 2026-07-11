@@ -292,6 +292,18 @@ const STATUS_LABEL_MAP: Record<string, string> = {
 
 const EXISTING_LABEL_RE = /^(✅ Pass|❌ Fail|⏭️ Skipped|🚫 Blocked|🟢 Pass|🔴 Fail|🟡 Skipped|🟣 Blocked)( 📅 \d{4}-\d{2}-\d{2})? \| /;
 
+/** Right-click context menu options for setting the status of every checklist
+ *  line inside the current selection at once. Both the checkbox character and
+ *  its ✅/❌/etc. label are stamped in one edit (see applyStatusLabel below),
+ *  so it's a single undo step and doesn't race the vault "modify" handler. */
+const BULK_STATUS_OPTIONS: Array<{ label: string; char: string; icon: string }> = [
+  { label: "Pass", char: "p", icon: "check" },
+  { label: "Fail", char: "f", icon: "x" },
+  { label: "Skipped", char: "s", icon: "skip-forward" },
+  { label: "Blocked", char: "b", icon: "ban" },
+  { label: "Not Run", char: " ", icon: "square" },
+];
+
 function applyStatusLabel(line: string): string {
   const match = line.match(/^(- \[([^\]]+)\] )([^]*)/);
   if (!match) return line;
@@ -367,6 +379,12 @@ function parseDateLabel(filename: string): string {
   const match = filename.match(/(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})/);
   if (!match) return filename.replace(/\.md$/, "");
   return `${MONTHS[parseInt(match[2]) - 1]} ${parseInt(match[3])} ${match[4]}:${match[5]}`;
+}
+
+/** Numeric-aware compare so "2 Foo" sorts before "10 Bar" — matches Obsidian's
+ *  own file-explorer ordering instead of plain lexicographic sort. */
+function naturalCompare(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 }
 
 function parseSortKey(filename: string): string {
@@ -518,6 +536,26 @@ class FolderSuggestModal extends SuggestModal<TFolder> {
   }
 }
 
+class FileSuggestModal extends SuggestModal<TFile> {
+  constructor(app: App, private callback: (path: string) => void) {
+    super(app);
+    this.setPlaceholder("Type to search markdown files…");
+  }
+
+  getSuggestions(query: string): TFile[] {
+    const q = query.toLowerCase();
+    return this.app.vault.getMarkdownFiles().filter((f) => f.path.toLowerCase().includes(q));
+  }
+
+  renderSuggestion(file: TFile, el: HTMLElement) {
+    el.createEl("div", { text: file.path });
+  }
+
+  onChooseSuggestion(file: TFile) {
+    this.callback(file.path);
+  }
+}
+
 class FileSelectModal extends Modal {
   private selected: Set<string> = new Set();
 
@@ -624,8 +662,8 @@ class FileSelectModal extends Modal {
     };
 
     const renderNode = (node: FolderNode, container: HTMLElement, depth: number) => {
-      const subfolders = Array.from(node.folders.values()).sort((a, b) => a.name.localeCompare(b.name));
-      const files = [...node.files].sort((a, b) => a.basename.localeCompare(b.basename));
+      const subfolders = Array.from(node.folders.values()).sort((a, b) => naturalCompare(a.name, b.name));
+      const files = [...node.files].sort((a, b) => naturalCompare(a.basename, b.basename));
 
       for (const sub of subfolders) {
         const wrapper = container.createDiv();
@@ -713,7 +751,13 @@ class FileSelectModal extends Modal {
             new Notice("Select at least one file.");
             return;
           }
-          const chosen = this.candidates.filter((f) => this.selected.has(f.path));
+          // Use the tree's render order (folders then files, matching what's
+          // shown on screen) rather than this.candidates' flat alphabetical-
+          // by-path order, so the generated run's file groups match the
+          // folder order the user just picked from.
+          const chosen = fileRows
+            .filter(({ file }) => this.selected.has(file.path))
+            .map(({ file }) => file);
           this.close();
           this.onSubmit(chosen);
         })
@@ -1179,7 +1223,7 @@ class AttributeSuggest extends EditorSuggest<string> {
 interface TMSSettings {
   defaultTestRunFolder: string;
   bugsFolder: string;
-  bugTemplate: string;
+  bugTemplatePath: string;
   enableDashboard: boolean;
   dashboardHiddenStatuses: string;
   showRibbonTestRun: boolean;
@@ -1195,7 +1239,7 @@ interface TMSSettings {
 const DEFAULT_SETTINGS: TMSSettings = {
   defaultTestRunFolder: "",
   bugsFolder: "",
-  bugTemplate: "",
+  bugTemplatePath: "",
   enableDashboard: true,
   dashboardHiddenStatuses: "done",
   showRibbonTestRun: true,
@@ -1254,13 +1298,13 @@ export default class TMSPlugin extends Plugin {
     this.addCommand({
       id: "insert-bug-template",
       name: "Insert Bug Template",
-      editorCallback: (editor: Editor) => {
+      editorCallback: async (editor: Editor) => {
         const file = this.app.workspace.getActiveFile();
         if (!file) return;
         const title = file.basename.startsWith("Bug - ")
           ? file.basename.replace(/^Bug - /, "")
           : file.basename;
-        const templateContent = this.bugTemplate(title);
+        const templateContent = await this.bugTemplate(title);
         if (!templateContent) {
           new Notice("No bug template configured. Set one in plugin settings.");
           return;
@@ -1310,7 +1354,7 @@ export default class TMSPlugin extends Plugin {
         const hasUserContent = current.trim() !== "" && current.trim() !== autoHeading;
         if (hasUserContent) return;
         const title = abstractFile.basename.replace(/^Bug - /, "");
-        const templateContent = this.bugTemplate(title);
+        const templateContent = await this.bugTemplate(title);
         // Skip if there's nothing to write and file is already empty
         if (!templateContent && current.trim() === "") return;
         await this.app.vault.modify(abstractFile, templateContent);
@@ -1345,6 +1389,66 @@ export default class TMSPlugin extends Plugin {
         this.processingFiles.add(abstractFile.path);
         await this.app.vault.modify(abstractFile, updated);
         setTimeout(() => this.processingFiles.delete(abstractFile.path), 300);
+      })
+    );
+
+    // Right-click on a selection spanning checklist lines — set all their
+    // statuses at once instead of clicking each checkbox individually.
+    this.registerEvent(
+      this.app.workspace.on("editor-menu", (menu, editor, info) => {
+        const file = info.file;
+        if (!file || file.name === "Dashboard.md") return;
+
+        const selections = editor.listSelections();
+        const hasSelection = selections.some(
+          (s) => s.anchor.line !== s.head.line || s.anchor.ch !== s.head.ch
+        );
+        if (!hasSelection) return;
+
+        let minLine = Infinity;
+        let maxLine = -Infinity;
+        for (const s of selections) {
+          minLine = Math.min(minLine, s.anchor.line, s.head.line);
+          maxLine = Math.max(maxLine, s.anchor.line, s.head.line);
+        }
+
+        const checklistLineRe = /^(\s*- )\[[^\]]*\](.*)$/;
+        let hasChecklistLine = false;
+        for (let i = minLine; i <= maxLine; i++) {
+          if (checklistLineRe.test(editor.getLine(i))) { hasChecklistLine = true; break; }
+        }
+        if (!hasChecklistLine) return;
+
+        menu.addSeparator();
+        for (const opt of BULK_STATUS_OPTIONS) {
+          menu.addItem((item) =>
+            item
+              .setTitle(`Set status: ${opt.label}`)
+              .setIcon(opt.icon)
+              .onClick(() => {
+                // Replace the whole range in one call so it's a single undo
+                // step — looping setLine() per line would let Ctrl+Z only
+                // revert the last line instead of the whole bulk change.
+                // The label is stamped inline (applyStatusLabel) instead of
+                // being left for the vault "modify" handler to add a moment
+                // later: that second, separate write became its own undo
+                // step and fought Ctrl+Z — undoing seemed to "revert" for an
+                // instant, then the status reappeared once the delayed
+                // label-stamping write landed.
+                const newLines: string[] = [];
+                for (let i = minLine; i <= maxLine; i++) {
+                  const line = editor.getLine(i);
+                  const match = line.match(checklistLineRe);
+                  newLines.push(match ? applyStatusLabel(`${match[1]}[${opt.char}]${match[2]}`) : line);
+                }
+                editor.replaceRange(
+                  newLines.join("\n"),
+                  { line: minLine, ch: 0 },
+                  { line: maxLine, ch: editor.getLine(maxLine).length }
+                );
+              })
+          );
+        }
       })
     );
 
@@ -1532,12 +1636,16 @@ export default class TMSPlugin extends Plugin {
     }
   }
 
-  private bugTemplate(title: string): string {
-    const tpl = this.settings.bugTemplate.trim();
-    if (tpl) {
-      return tpl.replace(/\{\{title\}\}/g, title);
+  private async bugTemplate(title: string): Promise<string> {
+    const path = this.settings.bugTemplatePath.trim();
+    if (!path) return "";
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      new Notice(`Bug template not found: ${path}`);
+      return "";
     }
-    return "";
+    const content = await this.app.vault.cachedRead(file);
+    return content.replace(/\{\{title\}\}/g, title);
   }
 
   async createBugFile(bugName: string, sourceFilePath: string): Promise<void> {
@@ -1546,7 +1654,7 @@ export default class TMSPlugin extends Plugin {
     const folder = this.getFolderPath(filePath);
     if (folder) await this.ensureFolder(folder);
     const title = bugName.replace(/^Bug - /, "");
-    await this.app.vault.create(filePath, this.bugTemplate(title));
+    await this.app.vault.create(filePath, await this.bugTemplate(title));
     new Notice(`Bug created: ${bugName}`);
   }
 
@@ -1751,10 +1859,10 @@ export default class TMSPlugin extends Plugin {
 
         await this.ensureFolder(runsFolder);
 
+        // Dashboard is created only on demand (Dashboard button/command) —
+        // not automatically here. If one already exists for this folder, it
+        // still gets refreshed below so it reflects the new run.
         const dashPath = this.joinPath(runsFolder, "Dashboard.md");
-        if (this.settings.enableDashboard && !this.app.vault.getAbstractFileByPath(dashPath)) {
-          await this.app.vault.create(dashPath, this.buildEmptyDashboard(suiteName));
-        }
 
         let runPath = this.joinPath(runsFolder, `${runName}.md`);
         if (this.app.vault.getAbstractFileByPath(runPath)) {
@@ -1852,7 +1960,7 @@ export default class TMSPlugin extends Plugin {
             ? filePath.substring(0, filePath.lastIndexOf("/"))
             : "";
           if (folder) await this.ensureFolder(folder);
-          await this.app.vault.create(filePath, this.bugTemplate(title));
+          await this.app.vault.create(filePath, await this.bugTemplate(title));
           new Notice(`Bug created: ${name}`);
         }
       }
@@ -1879,7 +1987,7 @@ export default class TMSPlugin extends Plugin {
         const filePath = this.getBugFilePath(bugName, file.path);
         const folder = this.getFolderPath(filePath);
         if (folder) await this.ensureFolder(folder);
-        await this.app.vault.create(filePath, this.bugTemplate(title));
+        await this.app.vault.create(filePath, await this.bugTemplate(title));
         new Notice(`Bug created: ${bugName}`);
         newFilesCreated = true;
       }
@@ -1913,35 +2021,38 @@ export default class TMSPlugin extends Plugin {
       return;
     }
 
-    // In a Test Runs folder — go to its Dashboard
-    if (file.parent?.name.endsWith(" Test Runs")) {
-      const dashPath = `${file.parent.path}/Dashboard.md`;
-      const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
-      if (dashFile instanceof TFile) {
-        const leaf1 = this.app.workspace.getLeaf();
-        if (!leaf1) { new Notice("Could not open file."); return; }
-        await leaf1.openFile(dashFile);
-        return;
-      }
-    }
+    const folderPath = file.parent?.name.endsWith(" Test Runs")
+      ? file.parent.path
+      : this.getRunsFolder(file.path);
 
-    // On any other file — navigate to the runs folder Dashboard
-    const runsFolder = this.getRunsFolder(file.path);
-    const dashPath = this.joinPath(runsFolder, "Dashboard.md");
-    const dashFile = this.app.vault.getAbstractFileByPath(dashPath);
-    if (dashFile instanceof TFile) {
-      const leaf2 = this.app.workspace.getLeaf();
-      if (!leaf2) { new Notice("Could not open file."); return; }
-      await leaf2.openFile(dashFile);
-    } else {
-      new Notice("No dashboard found. Create a test run first.");
-    }
+    const dashFile = await this.getOrCreateDashboard(folderPath);
+    const leaf = this.app.workspace.getLeaf();
+    if (!leaf) { new Notice("Could not open file."); return; }
+    await leaf.openFile(dashFile);
   }
 
   // ─── Dashboard ────────────────────────────────────────────────────────────
 
   private buildEmptyDashboard(suiteName: string): string {
     return `${DASHBOARD_MARKER}\n# ${suiteName} - Dashboard\n\n> Auto-refreshes when opened.\n\n*No test runs yet. Create your first test run to see statistics.*\n`;
+  }
+
+  private dashboardSuiteName(folderPath: string): string {
+    if (!folderPath) return this.app.vault.getName();
+    return (folderPath.split("/").pop() || folderPath).replace(/ Test Runs$/, "");
+  }
+
+  /** Dashboards are only created on demand (Dashboard button/command), never
+   *  as a side effect of generating a test run — see createRunFile above. */
+  private async getOrCreateDashboard(folderPath: string): Promise<TFile> {
+    const dashPath = this.joinPath(folderPath, "Dashboard.md");
+    const existing = this.app.vault.getAbstractFileByPath(dashPath);
+    if (existing instanceof TFile) return existing;
+
+    await this.ensureFolder(folderPath);
+    const created = await this.app.vault.create(dashPath, this.buildEmptyDashboard(this.dashboardSuiteName(folderPath)));
+    await this.regenerateDashboard(created);
+    return created;
   }
 
   async regenerateDashboard(dashFile: TFile) {
@@ -2132,26 +2243,33 @@ class TMSSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Bug template")
-      .setDesc("Template for new bug pages. Use {{title}} as a placeholder for the bug title. Leave empty to create a blank file (Obsidian shows the filename as title).")
-      .addTextArea((ta) => {
-        ta.setPlaceholder(
-          "---\nstatus: New\ntags: [Bug]\n---\n\n# {{title}}\n\n## Description\n\n## Steps to Reproduce"
-        ).setValue(this.plugin.settings.bugTemplate);
-        ta.inputEl.style.width = "320px";
-        ta.inputEl.style.height = "140px";
-        ta.inputEl.style.fontFamily = "monospace";
-        ta.onChange(async (value) => {
-          this.plugin.settings.bugTemplate = value;
+      .setDesc("Path to a note used as the template for new bug pages. Edit that note like any other Obsidian file. Use {{title}} inside it as a placeholder for the bug title. Leave empty to create a blank file (Obsidian shows the filename as title).")
+      .addText((text) => {
+        text
+          .setPlaceholder("e.g. Templates/Bug Report.md")
+          .setValue(this.plugin.settings.bugTemplatePath);
+        text.inputEl.style.width = "200px";
+        text.onChange(async (value) => {
+          this.plugin.settings.bugTemplatePath = value;
           await this.plugin.saveData(this.plugin.settings);
         });
-      });
+      })
+      .addButton((btn) =>
+        btn.setButtonText("Browse…").onClick(() => {
+          new FileSuggestModal(this.app, async (path) => {
+            this.plugin.settings.bugTemplatePath = path;
+            await this.plugin.saveData(this.plugin.settings);
+            this.display();
+          }).open();
+        })
+      );
 
     // ── Dashboard ─────────────────────────────────────────────────────────────
     containerEl.createEl("h3", { text: "Dashboard" });
 
     new Setting(containerEl)
       .setName("Enable Dashboard")
-      .setDesc("Auto-creates a Dashboard page in the test runs folder and refreshes it on open.")
+      .setDesc("Keeps the Dashboard page (created on demand via the Dashboard button/command) up to date on open and after each new test run.")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.enableDashboard).onChange(async (value) => {
           this.plugin.settings.enableDashboard = value;
