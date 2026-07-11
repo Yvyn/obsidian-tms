@@ -1405,19 +1405,21 @@ export default class TMSPlugin extends Plugin {
         );
         if (!hasSelection) return;
 
-        let minLine = Infinity;
-        let maxLine = -Infinity;
+        // Union of line numbers actually spanned by the selections — not
+        // just the outer min/max, since a multi-selection can be
+        // discontinuous (e.g. Cmd/Ctrl-selecting lines 1 and 3 but not 2).
+        const selectedLineSet = new Set<number>();
         for (const s of selections) {
-          minLine = Math.min(minLine, s.anchor.line, s.head.line);
-          maxLine = Math.max(maxLine, s.anchor.line, s.head.line);
+          const from = Math.min(s.anchor.line, s.head.line);
+          const to = Math.max(s.anchor.line, s.head.line);
+          for (let i = from; i <= to; i++) selectedLineSet.add(i);
         }
 
         const checklistLineRe = /^(\s*- )\[[^\]]*\](.*)$/;
-        let hasChecklistLine = false;
-        for (let i = minLine; i <= maxLine; i++) {
-          if (checklistLineRe.test(editor.getLine(i))) { hasChecklistLine = true; break; }
-        }
-        if (!hasChecklistLine) return;
+        const targetLines = Array.from(selectedLineSet)
+          .filter((i) => checklistLineRe.test(editor.getLine(i)))
+          .sort((a, b) => a - b);
+        if (targetLines.length === 0) return;
 
         menu.addSeparator();
         for (const opt of BULK_STATUS_OPTIONS) {
@@ -1426,26 +1428,27 @@ export default class TMSPlugin extends Plugin {
               .setTitle(`Set status: ${opt.label}`)
               .setIcon(opt.icon)
               .onClick(() => {
-                // Replace the whole range in one call so it's a single undo
-                // step — looping setLine() per line would let Ctrl+Z only
-                // revert the last line instead of the whole bulk change.
-                // The label is stamped inline (applyStatusLabel) instead of
-                // being left for the vault "modify" handler to add a moment
-                // later: that second, separate write became its own undo
-                // step and fought Ctrl+Z — undoing seemed to "revert" for an
-                // instant, then the status reappeared once the delayed
-                // label-stamping write landed.
-                const newLines: string[] = [];
-                for (let i = minLine; i <= maxLine; i++) {
-                  const line = editor.getLine(i);
-                  const match = line.match(checklistLineRe);
-                  newLines.push(match ? applyStatusLabel(`${match[1]}[${opt.char}]${match[2]}`) : line);
-                }
-                editor.replaceRange(
-                  newLines.join("\n"),
-                  { line: minLine, ch: 0 },
-                  { line: maxLine, ch: editor.getLine(maxLine).length }
-                );
+                // One transaction covering only the target lines (not a
+                // blanket line-range replace) so lines between two
+                // discontinuous selections are left untouched, and it's
+                // still a single undo step. The label is stamped inline
+                // (applyStatusLabel) instead of being left for the vault
+                // "modify" handler to add a moment later: that second,
+                // separate write became its own undo step and fought
+                // Ctrl+Z — undoing seemed to "revert" for an instant, then
+                // the status reappeared once the delayed write landed.
+                editor.transaction({
+                  changes: targetLines.map((i) => {
+                    const line = editor.getLine(i);
+                    const match = line.match(checklistLineRe)!;
+                    const newLine = applyStatusLabel(`${match[1]}[${opt.char}]${match[2]}`);
+                    return {
+                      from: { line: i, ch: 0 },
+                      to: { line: i, ch: line.length },
+                      text: newLine,
+                    };
+                  }),
+                });
               })
           );
         }

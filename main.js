@@ -1234,37 +1234,33 @@ var TMSPlugin = class extends import_obsidian.Plugin {
         );
         if (!hasSelection)
           return;
-        let minLine = Infinity;
-        let maxLine = -Infinity;
+        const selectedLineSet = /* @__PURE__ */ new Set();
         for (const s of selections) {
-          minLine = Math.min(minLine, s.anchor.line, s.head.line);
-          maxLine = Math.max(maxLine, s.anchor.line, s.head.line);
+          const from = Math.min(s.anchor.line, s.head.line);
+          const to = Math.max(s.anchor.line, s.head.line);
+          for (let i = from; i <= to; i++)
+            selectedLineSet.add(i);
         }
         const checklistLineRe = /^(\s*- )\[[^\]]*\](.*)$/;
-        let hasChecklistLine = false;
-        for (let i = minLine; i <= maxLine; i++) {
-          if (checklistLineRe.test(editor.getLine(i))) {
-            hasChecklistLine = true;
-            break;
-          }
-        }
-        if (!hasChecklistLine)
+        const targetLines = Array.from(selectedLineSet).filter((i) => checklistLineRe.test(editor.getLine(i))).sort((a, b) => a - b);
+        if (targetLines.length === 0)
           return;
         menu.addSeparator();
         for (const opt of BULK_STATUS_OPTIONS) {
           menu.addItem(
             (item) => item.setTitle(`Set status: ${opt.label}`).setIcon(opt.icon).onClick(() => {
-              const newLines = [];
-              for (let i = minLine; i <= maxLine; i++) {
-                const line = editor.getLine(i);
-                const match = line.match(checklistLineRe);
-                newLines.push(match ? applyStatusLabel(`${match[1]}[${opt.char}]${match[2]}`) : line);
-              }
-              editor.replaceRange(
-                newLines.join("\n"),
-                { line: minLine, ch: 0 },
-                { line: maxLine, ch: editor.getLine(maxLine).length }
-              );
+              editor.transaction({
+                changes: targetLines.map((i) => {
+                  const line = editor.getLine(i);
+                  const match = line.match(checklistLineRe);
+                  const newLine = applyStatusLabel(`${match[1]}[${opt.char}]${match[2]}`);
+                  return {
+                    from: { line: i, ch: 0 },
+                    to: { line: i, ch: line.length },
+                    text: newLine
+                  };
+                })
+              });
             })
           );
         }
