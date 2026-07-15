@@ -37,7 +37,11 @@ type TagState = "neutral" | "include" | "exclude";
 // ─── Playwright integration types ────────────────────────────────────────────
 
 interface PwTestResult { status: "passed" | "failed" | "timedOut" | "skipped" | "interrupted" }
-interface PwTest { status: string; results: PwTestResult[] }
+/** `status` is Playwright's own computed outcome (TestCase.outcome()) — use
+ *  this, not results[0].status: a genuinely skipped test can have an empty
+ *  `results` array (nothing ever ran), so results[0] is undefined while
+ *  `status` still correctly reports "skipped". */
+interface PwTest { status: "expected" | "unexpected" | "flaky" | "skipped"; results: PwTestResult[] }
 interface PwSpec { title: string; ok: boolean; tests: PwTest[] }
 interface PwSuite { title: string; suites?: PwSuite[]; specs?: PwSpec[] }
 interface PwJsonReport { suites: PwSuite[] }
@@ -407,23 +411,35 @@ function sanitizeRunFileName(name: string): string {
   return capped || defaultRunFileName();
 }
 
+/** Extracts every Txxx id from parenthesized groups in text, e.g. both ids
+ *  from "(T386, T387)" as well as the single id from "(T01)". A plain
+ *  /\(T(\d+)\)/ (no comma support) only matches when a group holds exactly
+ *  one id, silently dropping every id in a multi-id group. */
+function extractTmsIdsFromText(text: string): string[] {
+  const ids: string[] = [];
+  const groupRe = /\(([^)]*)\)/g;
+  let g: RegExpExecArray | null;
+  while ((g = groupRe.exec(text)) !== null) {
+    const idRe = /T(\d+)/gi;
+    let m: RegExpExecArray | null;
+    while ((m = idRe.exec(g[1])) !== null) ids.push(`T${m[1]}`);
+  }
+  return ids;
+}
+
 function extractTmsIds(content: string): string[] {
-  const seen = new Set<string>();
-  const regex = /\(T(\d+)\)/gi;
-  let m: RegExpExecArray | null;
-  while ((m = regex.exec(content)) !== null) seen.add(`T${m[1]}`);
-  return Array.from(seen);
+  return Array.from(new Set(extractTmsIdsFromText(content)));
 }
 
 function parsePwJsonReport(report: PwJsonReport): Map<string, string> {
   const map = new Map<string, string>();
   function walk(suite: PwSuite) {
     for (const spec of suite.specs ?? []) {
-      const m = spec.title.match(/\(T(\d+)\)/i);
-      if (!m) continue;
-      const resultStatus = spec.tests[0]?.results[0]?.status ?? "failed";
-      const status = resultStatus === "passed" ? "passed" : resultStatus === "skipped" ? "skipped" : "failed";
-      map.set(`T${m[1]}`, status);
+      const ids = extractTmsIdsFromText(spec.title);
+      if (ids.length === 0) continue;
+      const outcome = spec.tests[0]?.status;
+      const status = outcome === "skipped" ? "skipped" : outcome === "expected" || outcome === "flaky" ? "passed" : "failed";
+      for (const id of ids) map.set(id, status);
     }
     for (const sub of suite.suites ?? []) walk(sub);
   }
@@ -435,9 +451,9 @@ function applyPlaywrightResults(content: string, resultMap: Map<string, string>)
   const charMap: Record<string, string> = { passed: "p", failed: "f", skipped: "s" };
   let count = 0;
   const updated = content.split("\n").map(line => {
-    const m = line.match(/\(T(\d+)\)/i);
-    if (!m) return line;
-    const status = resultMap.get(`T${m[1]}`);
+    const ids = extractTmsIdsFromText(line);
+    if (ids.length === 0) return line;
+    const status = ids.map((id) => resultMap.get(id)).find((s): s is string => !!s);
     if (!status || !charMap[status]) return line;
     const newLine = line.replace(/^(\s*- \[)[^\]]*(\].*)$/, `$1${charMap[status]}$2`);
     if (newLine !== line) count++;
@@ -1528,9 +1544,13 @@ export default class TMSPlugin extends Plugin {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const fs = require("fs") as typeof import("fs");
 
-    const grep = ids.map(id => `\\(${id}\\)`).join("|");
+    // Word-boundary match, not "\(Txxx\)" — a spec whose title groups several
+    // ids in one set of parens, e.g. "(T380, T381, T382)", doesn't have any
+    // individual id immediately wrapped in its own "(" ")" pair, so a strict
+    // parens-adjacent pattern would never select that test to run at all.
+    const grep = ids.map(id => `\\b${id}\\b`).join("|");
     const tmpResults = path.join(os.tmpdir(), `tms-pw-${Date.now()}.json`);
-    const displayCmd = `${baseCommand} --grep "${ids.map(id => `(${id})`).join("|")}" --reporter=list`;
+    const displayCmd = `${baseCommand} --grep "${ids.map(id => `\\b${id}\\b`).join("|")}" --reporter=list`;
 
     const panel = await this.getPlaywrightPanel();
     panel.startRun(ids, displayCmd);

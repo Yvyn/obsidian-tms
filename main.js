@@ -350,27 +350,35 @@ function sanitizeRunFileName(name) {
   const capped = cleaned.length > 150 ? cleaned.slice(0, 150).trim() : cleaned;
   return capped || defaultRunFileName();
 }
+function extractTmsIdsFromText(text) {
+  const ids = [];
+  const groupRe = /\(([^)]*)\)/g;
+  let g;
+  while ((g = groupRe.exec(text)) !== null) {
+    const idRe = /T(\d+)/gi;
+    let m;
+    while ((m = idRe.exec(g[1])) !== null)
+      ids.push(`T${m[1]}`);
+  }
+  return ids;
+}
 function extractTmsIds(content) {
-  const seen = /* @__PURE__ */ new Set();
-  const regex = /\(T(\d+)\)/gi;
-  let m;
-  while ((m = regex.exec(content)) !== null)
-    seen.add(`T${m[1]}`);
-  return Array.from(seen);
+  return Array.from(new Set(extractTmsIdsFromText(content)));
 }
 function parsePwJsonReport(report) {
   const map = /* @__PURE__ */ new Map();
   function walk(suite) {
-    var _a, _b, _c, _d, _e;
+    var _a, _b, _c;
     for (const spec of (_a = suite.specs) != null ? _a : []) {
-      const m = spec.title.match(/\(T(\d+)\)/i);
-      if (!m)
+      const ids = extractTmsIdsFromText(spec.title);
+      if (ids.length === 0)
         continue;
-      const resultStatus = (_d = (_c = (_b = spec.tests[0]) == null ? void 0 : _b.results[0]) == null ? void 0 : _c.status) != null ? _d : "failed";
-      const status = resultStatus === "passed" ? "passed" : resultStatus === "skipped" ? "skipped" : "failed";
-      map.set(`T${m[1]}`, status);
+      const outcome = (_b = spec.tests[0]) == null ? void 0 : _b.status;
+      const status = outcome === "skipped" ? "skipped" : outcome === "expected" || outcome === "flaky" ? "passed" : "failed";
+      for (const id of ids)
+        map.set(id, status);
     }
-    for (const sub of (_e = suite.suites) != null ? _e : [])
+    for (const sub of (_c = suite.suites) != null ? _c : [])
       walk(sub);
   }
   for (const s of report.suites)
@@ -381,10 +389,10 @@ function applyPlaywrightResults(content, resultMap) {
   const charMap = { passed: "p", failed: "f", skipped: "s" };
   let count = 0;
   const updated = content.split("\n").map((line) => {
-    const m = line.match(/\(T(\d+)\)/i);
-    if (!m)
+    const ids = extractTmsIdsFromText(line);
+    if (ids.length === 0)
       return line;
-    const status = resultMap.get(`T${m[1]}`);
+    const status = ids.map((id) => resultMap.get(id)).find((s) => !!s);
     if (!status || !charMap[status])
       return line;
     const newLine = line.replace(/^(\s*- \[)[^\]]*(\].*)$/, `$1${charMap[status]}$2`);
@@ -1328,9 +1336,9 @@ var TMSPlugin = class extends import_obsidian.Plugin {
     const os = require("os");
     const path = require("path");
     const fs = require("fs");
-    const grep = ids.map((id) => `\\(${id}\\)`).join("|");
+    const grep = ids.map((id) => `\\b${id}\\b`).join("|");
     const tmpResults = path.join(os.tmpdir(), `tms-pw-${Date.now()}.json`);
-    const displayCmd = `${baseCommand} --grep "${ids.map((id) => `(${id})`).join("|")}" --reporter=list`;
+    const displayCmd = `${baseCommand} --grep "${ids.map((id) => `\\b${id}\\b`).join("|")}" --reporter=list`;
     const panel = await this.getPlaywrightPanel();
     panel.startRun(ids, displayCmd);
     const fullCmd = `${baseCommand} --grep "${grep}" --reporter=list,json`;
