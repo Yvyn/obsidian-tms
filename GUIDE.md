@@ -31,29 +31,31 @@ Lines starting with `#`, `##`, `###`, etc. (without indentation) are **sections*
 
 ```
 ## Authorization
-Login with valid credentials
-Login with wrong password
-Password recovery
+- [ ] Login with valid credentials
+- [ ] Login with wrong password
+- [ ] Password recovery
 
 ## User Profile
-Edit name
-Upload avatar
+- [ ] Edit name
+- [ ] Upload avatar
 ```
 
 > A heading is included in the test run only if at least one test case under it is selected.
 
 ### Test Cases
 
-Any line that is not a heading is a test case. Nesting is determined by indentation (tab or 2 spaces).
+Only a line written as a checklist item (`- [ ]`) is a test case — it gets its own checkbox in the review modal and counts toward the total. Any other line (plain text, a note, a bullet without `[ ]`) is **not** a separate test case; it's ignored unless it's indented under a real `- [ ]` line, in which case it's kept as extra detail that travels along with that test case into the test run, but is never itself selectable or counted. Nesting is determined by indentation (tab or 2 spaces).
 
 ```
 ## Cart
-Add item to cart
-  Check counter
-  Check total
-Remove item
-Place order
+- [ ] Add item to cart
+  - Check counter
+  - Check total
+- [ ] Remove item
+- [ ] Place order
 ```
+
+Here there are 3 test cases (Add item to cart, Remove item, Place order). "Check counter" and "Check total" aren't separate tests — they're steps that ride along with "Add item to cart" whenever it's selected.
 
 > A heading with indentation (`	## something`) is treated as a nested test case, not a section.
 
@@ -61,16 +63,16 @@ Place order
 
 ```markdown
 ## Authorization
-Login with valid credentials @smoke @regression
-Login with wrong password @regression
-Login via Google @oauth
+- [ ] Login with valid credentials @smoke @regression
+- [ ] Login with wrong password @regression
+- [ ] Login via Google @oauth
 
 ## API
-GET /users @api @smoke
-POST /users @api
-DELETE /users @api @destructive
-  Check 204 response
-  Verify record removed from DB
+- [ ] GET /users @api @smoke
+- [ ] POST /users @api
+- [ ] DELETE /users @api @destructive
+  - Check 204 response
+  - Verify record removed from DB
 ```
 
 ---
@@ -80,8 +82,8 @@ DELETE /users @api @destructive
 Attributes are tags in the format `@name` added at the end of a test case line. They are used for filtering when generating a test run.
 
 ```
-Login with valid credentials @smoke @regression
-GET /users @api @smoke
+- [ ] Login with valid credentials @smoke @regression
+- [ ] GET /users @api @smoke
 ```
 
 **Rules:**
@@ -133,6 +135,7 @@ A list of all test cases with sections. Cases matching the filter are pre-checke
 - Manually check or uncheck any case
 - Cases with nested items have a `▶` button to expand
 - Counter shows `N / Total selected`
+- **All / Selected only** toggle above the list — switch to **Selected only** to see just what will actually be generated, hiding everything you've unchecked (and any section left with nothing selected). Switch back to **All** to see and adjust the full list again.
 - **← Back** — return to attribute selection
 - **Test run file name** — editable field, defaults to `Test Run {date-time}`; change it if you want a different name
 - **Generate Test Run** — create the test run file
@@ -380,6 +383,12 @@ Open **Settings → Test Management System**.
 | Base folder for test runs | Folder where `{Suite} Test Runs/` folders are created. Leave empty for vault root. |
 | Bugs folder | Folder where bug files are saved. Leave empty to save next to the test run. |
 | Bug template | Path to a note used as the template for new bug files. Use `{{title}}` inside it for the bug name. Leave empty for a blank file. |
+
+### Test Run
+
+| Setting | Description |
+|---------|-------------|
+| Ignored paths | Folders or files to hide from the Test Run file picker, one per line. Matches the path itself and anything nested under it; `*` works as a wildcard (e.g. `WIP/*`). Use it to keep drafts and work-in-progress notes out of the picker. |
 
 ### Dashboard
 

@@ -4,11 +4,13 @@ An Obsidian plugin for managing QA test cases — create test plans, filter by a
 
 ## Features
 
-- **Test Plans** — write test cases in regular `.md` files using headings and indentation
+- **Test Plans** — write test cases as `- [ ]` checklist items grouped under headings; indent extra detail (steps, notes) under a case and it travels with it into the test run without being counted as its own test
 - **Attribute Tags** — tag cases with `@smoke`, `@regression`, `@api`, etc.
 - **Autocomplete** — type `@` and get suggestions from all attributes in the vault
 - **Test Run Generator** — filter cases by tags (include/exclude) with live tag search, review the list with section checkboxes, and generate a `.md` test run file
 - **Section Selection** — each heading in the review modal has a checkbox to select/deselect all cases under it at once; indeterminate state shows partial selection
+- **All / Selected only view** — toggle the review list to show just what you've selected before generating the run
+- **Ignored Paths** — exclude draft/WIP folders and files from the Test Run file picker
 - **Status Tracking** — mark cases as Pass `[p]`, Fail `[f]`, Skipped `[s]`, Blocked `[b]`; labels are added automatically
 - **Results Summary** — run the Results command to append a statistics table to the test run
 
@@ -18,15 +20,15 @@ An Obsidian plugin for managing QA test cases — create test plans, filter by a
 
 ```markdown
 ## Authorization
-Login with valid credentials @smoke @regression
-Login with wrong password @regression
+- [ ] Login with valid credentials @smoke @regression
+- [ ] Login with wrong password @regression
 
 ## API
-GET /users @api @smoke
-POST /users @api
-DELETE /users @api @destructive
-  Check 204 response
-  Verify record removed from DB
+- [ ] GET /users @api @smoke
+- [ ] POST /users @api
+- [ ] DELETE /users @api @destructive
+  - Check 204 response
+  - Verify record removed from DB
 ```
 
 ### Generating a Test Run
@@ -63,6 +65,7 @@ See [full documentation](https://github.com/Yvyn/obsidian-tms/blob/main/GUIDE.md
 **Settings → TMS**
 
 - **Test Run Folder** — folder where generated runs are saved (empty = vault root)
+- **Ignored Paths** — folders/files to hide from the Test Run file picker (one per line, `*` wildcard supported)
 - Toggle ribbon and status bar buttons on/off independently
 
 ## Installation

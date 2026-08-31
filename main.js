@@ -45,11 +45,12 @@ function parseTestCase(line, lineNumber) {
     const name2 = firstTagIndex2 >= 0 ? rawName.slice(0, firstTagIndex2).trim() : rawName;
     return { line: trimmed, name: name2, tags: tags2, lineNumber, indent: 0, children: [], hasChildren: false, isHeading: true, headingLevel };
   }
+  const hasCheckbox = /^-\s*\[[^\]]*\]/.test(trimmed);
   const leadingWhitespace = ((_a = line.match(/^(\s*)/)) == null ? void 0 : _a[1]) || "";
   const tabCount = (leadingWhitespace.match(/\t/g) || []).length;
   const spaceCount = (leadingWhitespace.match(/ /g) || []).length;
   const indent = tabCount + Math.floor(spaceCount / 2);
-  const normalized = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, "").replace(/^(✅ Pass|❌ Fail|⏭️ Skipped|🚫 Blocked)\s*\|\s*/, "").replace(/^\*\*(.*?)\*\*(.*)$/, "$1$2");
+  const normalized = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, "").replace(/^-\s*/, "").replace(/^(✅ Pass|❌ Fail|⏭️ Skipped|🚫 Blocked)\s*\|\s*/, "").replace(/^\*\*(.*?)\*\*(.*)$/, "$1$2");
   const tagRegex = /@([\p{L}\p{N}_-]+)/gu;
   const tags = [];
   let match;
@@ -58,7 +59,7 @@ function parseTestCase(line, lineNumber) {
   }
   const firstTagIndex = normalized.search(/@[\p{L}\p{N}_-]+/u);
   const name = firstTagIndex >= 0 ? normalized.slice(0, firstTagIndex).trim() : normalized;
-  return { line: trimmed, name, tags, lineNumber, indent, children: [], hasChildren: false };
+  return { line: trimmed, name, tags, lineNumber, indent, children: [], hasChildren: false, hasCheckbox };
 }
 function parseTestCases(content) {
   const lines = content.split("\n");
@@ -103,12 +104,26 @@ function parseTestCases(content) {
       indentStack.push({ item, indent: item.indent });
     }
   }
-  return rootItems;
+  return pruneOrphanText(rootItems);
+}
+function pruneOrphanText(items) {
+  const result = [];
+  for (const tc of items) {
+    if (tc.isHeading) {
+      const children = pruneOrphanText(tc.children);
+      result.push({ ...tc, children, hasChildren: children.length > 0 });
+    } else if (tc.hasCheckbox) {
+      result.push(tc);
+    } else {
+      result.push(...pruneOrphanText(tc.children));
+    }
+  }
+  return result;
 }
 function countLeafTestCases(items) {
   let count = 0;
   for (const tc of items) {
-    if (!tc.isHeading)
+    if (!tc.isHeading && tc.hasCheckbox)
       count++;
     count += countLeafTestCases(tc.children);
   }
@@ -118,7 +133,7 @@ function getAllTags(testCases) {
   const tagSet = /* @__PURE__ */ new Set();
   const collect = (items) => {
     items.forEach((tc) => {
-      if (!tc.isHeading)
+      if (!tc.isHeading && tc.hasCheckbox)
         tc.tags.forEach((t) => tagSet.add(t));
       if (tc.children.length > 0)
         collect(tc.children);
@@ -130,7 +145,7 @@ function getAllTags(testCases) {
 function collectLeafLineNumbers(items) {
   const result = [];
   for (const tc of items) {
-    if (!tc.isHeading)
+    if (!tc.isHeading && tc.hasCheckbox)
       result.push(tc.lineNumber);
     if (tc.children.length > 0)
       result.push(...collectLeafLineNumbers(tc.children));
@@ -336,6 +351,20 @@ function parseDateLabel(filename) {
 }
 function naturalCompare(a, b) {
   return a.localeCompare(b, void 0, { numeric: true, sensitivity: "base" });
+}
+function parseIgnorePatterns(raw) {
+  return raw.split("\n").map((p) => p.trim()).filter((p) => p.length > 0 && !p.startsWith("#"));
+}
+function matchesIgnorePattern(path, pattern) {
+  const normalizedPattern = pattern.replace(/\/+$/, "");
+  if (normalizedPattern.includes("*")) {
+    const escaped = normalizedPattern.split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*");
+    return new RegExp(`^${escaped}$`, "i").test(path);
+  }
+  return path.toLowerCase() === normalizedPattern.toLowerCase() || path.toLowerCase().startsWith(normalizedPattern.toLowerCase() + "/");
+}
+function isPathIgnored(path, patterns) {
+  return patterns.some((pattern) => matchesIgnorePattern(path, pattern));
 }
 function parseSortKey(filename) {
   const match = filename.match(/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}/);
@@ -786,9 +815,12 @@ var TestReviewModal = class extends import_obsidian.Modal {
     this.checkedItems = /* @__PURE__ */ new Set();
     this.checkboxRefs = [];
     this.headingCheckboxRefs = [];
+    this.itemRowRefs = [];
+    this.headingRowRefs = [];
+    this.viewMode = "all";
     const addChecked = (items) => {
       for (const tc of items) {
-        if (!tc.isHeading)
+        if (!tc.isHeading && tc.hasCheckbox)
           this.checkedItems.add(tc.lineNumber);
         if (tc.children.length > 0)
           addChecked(tc.children);
@@ -826,8 +858,11 @@ var TestReviewModal = class extends import_obsidian.Modal {
       counterEl.textContent = `${this.checkedItems.size} / ${totalTestCount} tests selected`;
     };
     updateCounter();
+    const viewToggleEl = contentEl.createDiv({ cls: "qa-view-toggle" });
     const listEl = contentEl.createDiv({ cls: "qa-review-list" });
     this.checkboxRefs = [];
+    this.itemRowRefs = [];
+    this.headingRowRefs = [];
     const renderTree = (items, container, isCheckable, childDepth, parentHeadingLevel = 0) => {
       items.forEach((tc) => {
         if (tc.isHeading && tc.name === "__manually_added_separator__") {
@@ -842,6 +877,7 @@ var TestReviewModal = class extends import_obsidian.Modal {
             headingEl.style.borderLeftColor = "var(--color-orange)";
           headingEl.style.paddingLeft = `${(tc.headingLevel - 1) * 20 + 10}px`;
           const leafLineNumbers = collectLeafLineNumbers(tc.children);
+          this.headingRowRefs.push({ lineNumbers: leafLineNumbers, el: headingEl });
           if (leafLineNumbers.length > 0) {
             const headingCb = headingEl.createEl("input", { attr: { type: "checkbox" } });
             headingCb.addClass("qa-heading-checkbox");
@@ -863,6 +899,7 @@ var TestReviewModal = class extends import_obsidian.Modal {
               });
               updateCounter();
               this.headingCheckboxRefs.forEach((ref) => ref.update());
+              applyViewFilter();
             });
           }
           const level = Math.min(tc.headingLevel || 2, 6);
@@ -886,6 +923,7 @@ var TestReviewModal = class extends import_obsidian.Modal {
               if (ref.lineNumbers.includes(tc.lineNumber))
                 ref.update();
             });
+            applyViewFilter();
           });
           this.checkboxRefs.push({ lineNumber: tc.lineNumber, cb });
         } else {
@@ -894,8 +932,10 @@ var TestReviewModal = class extends import_obsidian.Modal {
           bullet.style.color = "var(--text-faint)";
           bullet.textContent = "\xB7";
         }
+        let childrenElRef = null;
         if (tc.hasChildren) {
           const childrenEl = document.createElement("div");
+          childrenElRef = childrenEl;
           if (isCheckable) {
             let expanded = false;
             const toggle = itemEl.createEl("span");
@@ -954,9 +994,45 @@ var TestReviewModal = class extends import_obsidian.Modal {
             });
           }
         }
+        if (isCheckable) {
+          this.itemRowRefs.push({
+            lineNumber: tc.lineNumber,
+            els: childrenElRef ? [itemEl, childrenElRef] : [itemEl]
+          });
+        }
       });
     };
     renderTree(this.allTestCases, listEl, true, 0, 0);
+    const applyViewFilter = () => {
+      const showAll = this.viewMode === "all";
+      this.itemRowRefs.forEach(({ lineNumber, els }) => {
+        const visible = showAll || this.checkedItems.has(lineNumber);
+        els.forEach((el) => {
+          el.style.display = visible ? "" : "none";
+        });
+      });
+      this.headingRowRefs.forEach(({ lineNumbers, el }) => {
+        const visible = showAll || lineNumbers.some((ln) => this.checkedItems.has(ln));
+        el.style.display = visible ? "" : "none";
+      });
+    };
+    const allViewBtn = viewToggleEl.createEl("button", { text: "All", cls: "qa-view-toggle-btn" });
+    const selectedViewBtn = viewToggleEl.createEl("button", { text: "Selected only", cls: "qa-view-toggle-btn" });
+    const updateViewToggleButtons = () => {
+      allViewBtn.toggleClass("is-active", this.viewMode === "all");
+      selectedViewBtn.toggleClass("is-active", this.viewMode === "selected");
+    };
+    updateViewToggleButtons();
+    allViewBtn.addEventListener("click", () => {
+      this.viewMode = "all";
+      updateViewToggleButtons();
+      applyViewFilter();
+    });
+    selectedViewBtn.addEventListener("click", () => {
+      this.viewMode = "selected";
+      updateViewToggleButtons();
+      applyViewFilter();
+    });
     const collectSelected = (items) => {
       const result = [];
       for (const tc of items) {
@@ -964,7 +1040,7 @@ var TestReviewModal = class extends import_obsidian.Modal {
           const selectedChildren = collectSelected(tc.children);
           if (selectedChildren.length > 0)
             result.push({ ...tc, children: selectedChildren, hasChildren: true });
-        } else if (this.checkedItems.has(tc.lineNumber)) {
+        } else if (!tc.hasCheckbox || this.checkedItems.has(tc.lineNumber)) {
           result.push({ ...tc, children: collectSelected(tc.children) });
         }
       }
@@ -1089,6 +1165,7 @@ var DEFAULT_SETTINGS = {
   defaultTestRunFolder: "",
   bugsFolder: "",
   bugTemplatePath: "",
+  testRunIgnorePaths: "",
   enableDashboard: true,
   dashboardHiddenStatuses: "done",
   showRibbonTestRun: true,
@@ -1504,7 +1581,8 @@ Failed to start process: ${err.message}
     this.showFileSelectModal(activeFile ? [activeFile] : [], (selectedFiles) => this.openTestRunFlow(selectedFiles));
   }
   showFileSelectModal(preselected, onChosen, onGoBack = null) {
-    const candidates = this.app.vault.getMarkdownFiles().sort((a, b) => a.path.localeCompare(b.path));
+    const ignorePatterns = parseIgnorePatterns(this.settings.testRunIgnorePaths);
+    const candidates = this.app.vault.getMarkdownFiles().filter((f) => !isPathIgnored(f.path, ignorePatterns)).sort((a, b) => a.path.localeCompare(b.path));
     new FileSelectModal(this.app, candidates, preselected, onChosen, onGoBack).open();
   }
   async openTestRunFlow(files) {
@@ -1549,7 +1627,7 @@ Failed to start process: ${err.message}
         const suiteNames = /* @__PURE__ */ new Set();
         const collectSuiteNames = (items) => {
           for (const tc of items) {
-            if (!tc.isHeading)
+            if (!tc.isHeading && tc.hasCheckbox)
               suiteNames.add(tc.name.trim());
             collectSuiteNames(tc.children);
           }
@@ -1997,6 +2075,16 @@ var TMSSettingTab = class extends import_obsidian.PluginSettingTab {
         }).open();
       })
     );
+    containerEl.createEl("h3", { text: "Test Run" });
+    new import_obsidian.Setting(containerEl).setName("Ignored paths").setDesc("Folders or files to hide from the Test Run file picker (one per line). Matches the path itself and anything nested under it; use * as a wildcard. Handy for excluding drafts/WIP notes. Example: Drafts, WIP/*").addTextArea((text) => {
+      text.setPlaceholder("Drafts\nWIP/*").setValue(this.plugin.settings.testRunIgnorePaths);
+      text.inputEl.rows = 4;
+      text.inputEl.style.width = "260px";
+      text.onChange(async (value) => {
+        this.plugin.settings.testRunIgnorePaths = value;
+        await this.plugin.saveData(this.plugin.settings);
+      });
+    });
     containerEl.createEl("h3", { text: "Dashboard" });
     new import_obsidian.Setting(containerEl).setName("Enable Dashboard").setDesc("Keeps the Dashboard page (created on demand via the Dashboard button/command) up to date on open and after each new test run.").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.enableDashboard).onChange(async (value) => {

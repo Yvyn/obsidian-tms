@@ -30,6 +30,10 @@ interface TestCase {
   isHeading?: boolean;
   headingLevel?: number;
   isManuallyAdded?: boolean;
+  /** True for an actual `- [ ]` checklist line. False for other non-empty,
+   *  non-heading lines (plain descriptions) — these are only kept in the
+   *  tree when nested under a real checklist item; see pruneOrphanText. */
+  hasCheckbox?: boolean;
 }
 
 type TagState = "neutral" | "include" | "exclude";
@@ -74,6 +78,8 @@ function parseTestCase(line: string, lineNumber: number): TestCase | null {
     return { line: trimmed, name, tags, lineNumber, indent: 0, children: [], hasChildren: false, isHeading: true, headingLevel };
   }
 
+  const hasCheckbox = /^-\s*\[[^\]]*\]/.test(trimmed);
+
   const leadingWhitespace = line.match(/^(\s*)/)?.[1] || "";
   const tabCount = (leadingWhitespace.match(/\t/g) || []).length;
   const spaceCount = (leadingWhitespace.match(/ /g) || []).length;
@@ -81,6 +87,7 @@ function parseTestCase(line: string, lineNumber: number): TestCase | null {
 
   const normalized = trimmed
     .replace(/^-\s*\[[^\]]*\]\s*/, "")
+    .replace(/^-\s*/, "")
     .replace(/^(✅ Pass|❌ Fail|⏭️ Skipped|🚫 Blocked)\s*\|\s*/, "")
     .replace(/^\*\*(.*?)\*\*(.*)$/, "$1$2");
 
@@ -95,7 +102,7 @@ function parseTestCase(line: string, lineNumber: number): TestCase | null {
   const firstTagIndex = normalized.search(/@[\p{L}\p{N}_-]+/u);
   const name = firstTagIndex >= 0 ? normalized.slice(0, firstTagIndex).trim() : normalized;
 
-  return { line: trimmed, name, tags, lineNumber, indent, children: [], hasChildren: false };
+  return { line: trimmed, name, tags, lineNumber, indent, children: [], hasChildren: false, hasCheckbox };
 }
 
 function parseTestCases(content: string): TestCase[] {
@@ -144,13 +151,32 @@ function parseTestCases(content: string): TestCase[] {
     }
   }
 
-  return rootItems;
+  return pruneOrphanText(rootItems);
+}
+
+/** Drops non-checklist lines (plain descriptions, notes) unless they're
+ *  nested under a real `- [ ]` item — those travel with their test into the
+ *  Test Run. A stray description with no checklist ancestor is removed, but
+ *  any checklist item nested under it is promoted up rather than lost. */
+function pruneOrphanText(items: TestCase[]): TestCase[] {
+  const result: TestCase[] = [];
+  for (const tc of items) {
+    if (tc.isHeading) {
+      const children = pruneOrphanText(tc.children);
+      result.push({ ...tc, children, hasChildren: children.length > 0 });
+    } else if (tc.hasCheckbox) {
+      result.push(tc);
+    } else {
+      result.push(...pruneOrphanText(tc.children));
+    }
+  }
+  return result;
 }
 
 function countLeafTestCases(items: TestCase[]): number {
   let count = 0;
   for (const tc of items) {
-    if (!tc.isHeading) count++;
+    if (!tc.isHeading && tc.hasCheckbox) count++;
     count += countLeafTestCases(tc.children);
   }
   return count;
@@ -160,7 +186,7 @@ function getAllTags(testCases: TestCase[]): string[] {
   const tagSet = new Set<string>();
   const collect = (items: TestCase[]) => {
     items.forEach((tc) => {
-      if (!tc.isHeading) tc.tags.forEach((t) => tagSet.add(t));
+      if (!tc.isHeading && tc.hasCheckbox) tc.tags.forEach((t) => tagSet.add(t));
       if (tc.children.length > 0) collect(tc.children);
     });
   };
@@ -171,7 +197,7 @@ function getAllTags(testCases: TestCase[]): string[] {
 function collectLeafLineNumbers(items: TestCase[]): number[] {
   const result: number[] = [];
   for (const tc of items) {
-    if (!tc.isHeading) result.push(tc.lineNumber);
+    if (!tc.isHeading && tc.hasCheckbox) result.push(tc.lineNumber);
     if (tc.children.length > 0) result.push(...collectLeafLineNumbers(tc.children));
   }
   return result;
@@ -389,6 +415,37 @@ function parseDateLabel(filename: string): string {
  *  own file-explorer ordering instead of plain lexicographic sort. */
 function naturalCompare(a: string, b: string): number {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+}
+
+/** Parses the newline-separated "Test Run ignore" setting into individual
+ *  patterns (blank lines and comments starting with # are dropped). */
+function parseIgnorePatterns(raw: string): string[] {
+  return raw
+    .split("\n")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0 && !p.startsWith("#"));
+}
+
+/** True when `path` matches an ignore pattern: a bare folder/file path
+ *  matches itself or anything nested under it, and `*` acts as a wildcard
+ *  matching any run of characters (e.g. "Drafts/*", "*.wip.md"). */
+function matchesIgnorePattern(path: string, pattern: string): boolean {
+  const normalizedPattern = pattern.replace(/\/+$/, "");
+  if (normalizedPattern.includes("*")) {
+    const escaped = normalizedPattern
+      .split("*")
+      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join(".*");
+    return new RegExp(`^${escaped}$`, "i").test(path);
+  }
+  return (
+    path.toLowerCase() === normalizedPattern.toLowerCase() ||
+    path.toLowerCase().startsWith(normalizedPattern.toLowerCase() + "/")
+  );
+}
+
+function isPathIgnored(path: string, patterns: string[]): boolean {
+  return patterns.some((pattern) => matchesIgnorePattern(path, pattern));
 }
 
 function parseSortKey(filename: string): string {
@@ -900,6 +957,9 @@ class TestReviewModal extends Modal {
   private checkedItems: Set<number> = new Set();
   private checkboxRefs: Array<{ lineNumber: number; cb: HTMLInputElement }> = [];
   private headingCheckboxRefs: Array<{ lineNumbers: number[]; cb: HTMLInputElement; update: () => void }> = [];
+  private itemRowRefs: Array<{ lineNumber: number; els: HTMLElement[] }> = [];
+  private headingRowRefs: Array<{ lineNumbers: number[]; el: HTMLElement }> = [];
+  private viewMode: "all" | "selected" = "all";
 
   constructor(
     app: App,
@@ -915,7 +975,7 @@ class TestReviewModal extends Modal {
     super(app);
     const addChecked = (items: TestCase[]) => {
       for (const tc of items) {
-        if (!tc.isHeading) this.checkedItems.add(tc.lineNumber);
+        if (!tc.isHeading && tc.hasCheckbox) this.checkedItems.add(tc.lineNumber);
         if (tc.children.length > 0) addChecked(tc.children);
       }
     };
@@ -959,8 +1019,12 @@ class TestReviewModal extends Modal {
     };
     updateCounter();
 
+    const viewToggleEl = contentEl.createDiv({ cls: "qa-view-toggle" });
+
     const listEl = contentEl.createDiv({ cls: "qa-review-list" });
     this.checkboxRefs = [];
+    this.itemRowRefs = [];
+    this.headingRowRefs = [];
 
     const renderTree = (items: TestCase[], container: HTMLElement, isCheckable: boolean, childDepth: number, parentHeadingLevel: number = 0) => {
       items.forEach((tc: TestCase) => {
@@ -975,6 +1039,7 @@ class TestReviewModal extends Modal {
           if (tc.isManuallyAdded) headingEl.style.borderLeftColor = "var(--color-orange)";
           headingEl.style.paddingLeft = `${(tc.headingLevel! - 1) * 20 + 10}px`;
           const leafLineNumbers = collectLeafLineNumbers(tc.children);
+          this.headingRowRefs.push({ lineNumbers: leafLineNumbers, el: headingEl });
           if (leafLineNumbers.length > 0) {
             const headingCb = headingEl.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
             headingCb.addClass("qa-heading-checkbox");
@@ -993,6 +1058,7 @@ class TestReviewModal extends Modal {
               });
               updateCounter();
               this.headingCheckboxRefs.forEach(ref => ref.update());
+              applyViewFilter();
             });
           }
           const level = Math.min(tc.headingLevel || 2, 6) as 1|2|3|4|5|6;
@@ -1014,6 +1080,7 @@ class TestReviewModal extends Modal {
             this.headingCheckboxRefs.forEach(ref => {
               if (ref.lineNumbers.includes(tc.lineNumber)) ref.update();
             });
+            applyViewFilter();
           });
           this.checkboxRefs.push({ lineNumber: tc.lineNumber, cb });
         } else {
@@ -1023,8 +1090,10 @@ class TestReviewModal extends Modal {
           bullet.textContent = "·";
         }
 
+        let childrenElRef: HTMLElement | null = null;
         if (tc.hasChildren) {
           const childrenEl = document.createElement("div");
+          childrenElRef = childrenEl;
 
           if (isCheckable) {
             let expanded = false;
@@ -1078,10 +1147,47 @@ class TestReviewModal extends Modal {
             });
           }
         }
+
+        if (isCheckable) {
+          this.itemRowRefs.push({
+            lineNumber: tc.lineNumber,
+            els: childrenElRef ? [itemEl, childrenElRef] : [itemEl],
+          });
+        }
       });
     };
 
     renderTree(this.allTestCases, listEl, true, 0, 0);
+
+    const applyViewFilter = () => {
+      const showAll = this.viewMode === "all";
+      this.itemRowRefs.forEach(({ lineNumber, els }) => {
+        const visible = showAll || this.checkedItems.has(lineNumber);
+        els.forEach((el) => { el.style.display = visible ? "" : "none"; });
+      });
+      this.headingRowRefs.forEach(({ lineNumbers, el }) => {
+        const visible = showAll || lineNumbers.some((ln) => this.checkedItems.has(ln));
+        el.style.display = visible ? "" : "none";
+      });
+    };
+
+    const allViewBtn = viewToggleEl.createEl("button", { text: "All", cls: "qa-view-toggle-btn" });
+    const selectedViewBtn = viewToggleEl.createEl("button", { text: "Selected only", cls: "qa-view-toggle-btn" });
+    const updateViewToggleButtons = () => {
+      allViewBtn.toggleClass("is-active", this.viewMode === "all");
+      selectedViewBtn.toggleClass("is-active", this.viewMode === "selected");
+    };
+    updateViewToggleButtons();
+    allViewBtn.addEventListener("click", () => {
+      this.viewMode = "all";
+      updateViewToggleButtons();
+      applyViewFilter();
+    });
+    selectedViewBtn.addEventListener("click", () => {
+      this.viewMode = "selected";
+      updateViewToggleButtons();
+      applyViewFilter();
+    });
 
     const collectSelected = (items: TestCase[]): TestCase[] => {
       const result: TestCase[] = [];
@@ -1089,7 +1195,9 @@ class TestReviewModal extends Modal {
         if (tc.isHeading) {
           const selectedChildren = collectSelected(tc.children);
           if (selectedChildren.length > 0) result.push({ ...tc, children: selectedChildren, hasChildren: true });
-        } else if (this.checkedItems.has(tc.lineNumber)) {
+        } else if (!tc.hasCheckbox || this.checkedItems.has(tc.lineNumber)) {
+          // Non-checkbox descriptive children always travel with their real
+          // test — they have no checkbox of their own to be excluded via.
           result.push({ ...tc, children: collectSelected(tc.children) });
         }
       }
@@ -1240,6 +1348,7 @@ interface TMSSettings {
   defaultTestRunFolder: string;
   bugsFolder: string;
   bugTemplatePath: string;
+  testRunIgnorePaths: string;
   enableDashboard: boolean;
   dashboardHiddenStatuses: string;
   showRibbonTestRun: boolean;
@@ -1256,6 +1365,7 @@ const DEFAULT_SETTINGS: TMSSettings = {
   defaultTestRunFolder: "",
   bugsFolder: "",
   bugTemplatePath: "",
+  testRunIgnorePaths: "",
   enableDashboard: true,
   dashboardHiddenStatuses: "done",
   showRibbonTestRun: true,
@@ -1724,7 +1834,10 @@ export default class TMSPlugin extends Plugin {
     onChosen: (files: TFile[]) => void,
     onGoBack: (() => void) | null = null
   ) {
-    const candidates = this.app.vault.getMarkdownFiles().sort((a, b) => a.path.localeCompare(b.path));
+    const ignorePatterns = parseIgnorePatterns(this.settings.testRunIgnorePaths);
+    const candidates = this.app.vault.getMarkdownFiles()
+      .filter((f) => !isPathIgnored(f.path, ignorePatterns))
+      .sort((a, b) => a.path.localeCompare(b.path));
     new FileSelectModal(this.app, candidates, preselected, onChosen, onGoBack).open();
   }
 
@@ -1780,7 +1893,7 @@ export default class TMSPlugin extends Plugin {
         const suiteNames = new Set<string>();
         const collectSuiteNames = (items: TestCase[]) => {
           for (const tc of items) {
-            if (!tc.isHeading) suiteNames.add(tc.name.trim());
+            if (!tc.isHeading && tc.hasCheckbox) suiteNames.add(tc.name.trim());
             collectSuiteNames(tc.children);
           }
         };
@@ -2286,6 +2399,24 @@ class TMSSettingTab extends PluginSettingTab {
           }).open();
         })
       );
+
+    // ── Test Run ──────────────────────────────────────────────────────────────
+    containerEl.createEl("h3", { text: "Test Run" });
+
+    new Setting(containerEl)
+      .setName("Ignored paths")
+      .setDesc("Folders or files to hide from the Test Run file picker (one per line). Matches the path itself and anything nested under it; use * as a wildcard. Handy for excluding drafts/WIP notes. Example: Drafts, WIP/*")
+      .addTextArea((text) => {
+        text
+          .setPlaceholder("Drafts\nWIP/*")
+          .setValue(this.plugin.settings.testRunIgnorePaths);
+        text.inputEl.rows = 4;
+        text.inputEl.style.width = "260px";
+        text.onChange(async (value) => {
+          this.plugin.settings.testRunIgnorePaths = value;
+          await this.plugin.saveData(this.plugin.settings);
+        });
+      });
 
     // ── Dashboard ─────────────────────────────────────────────────────────────
     containerEl.createEl("h3", { text: "Dashboard" });
