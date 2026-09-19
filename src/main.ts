@@ -78,7 +78,9 @@ function parseTestCase(line: string, lineNumber: number): TestCase | null {
     return { line: trimmed, name, tags, lineNumber, indent: 0, children: [], hasChildren: false, isHeading: true, headingLevel };
   }
 
-  const hasCheckbox = /^-\s*\[[^\]]*\]/.test(trimmed);
+  // Obsidian task checkboxes work the same on both unordered ("- [ ]") and
+  // ordered ("1. [ ]") list markers — accept either as a real test case.
+  const hasCheckbox = /^(?:-|\d+\.)\s*\[[^\]]*\]/.test(trimmed);
 
   const leadingWhitespace = line.match(/^(\s*)/)?.[1] || "";
   const tabCount = (leadingWhitespace.match(/\t/g) || []).length;
@@ -86,8 +88,8 @@ function parseTestCase(line: string, lineNumber: number): TestCase | null {
   const indent = tabCount + Math.floor(spaceCount / 2);
 
   const normalized = trimmed
-    .replace(/^-\s*\[[^\]]*\]\s*/, "")
-    .replace(/^-\s*/, "")
+    .replace(/^(?:-|\d+\.)\s*\[[^\]]*\]\s*/, "")
+    .replace(/^(?:-|\d+\.)\s*/, "")
     .replace(/^(✅ Pass|❌ Fail|⏭️ Skipped|🚫 Blocked)\s*\|\s*/, "")
     .replace(/^\*\*(.*?)\*\*(.*)$/, "$1$2");
 

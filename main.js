@@ -45,12 +45,12 @@ function parseTestCase(line, lineNumber) {
     const name2 = firstTagIndex2 >= 0 ? rawName.slice(0, firstTagIndex2).trim() : rawName;
     return { line: trimmed, name: name2, tags: tags2, lineNumber, indent: 0, children: [], hasChildren: false, isHeading: true, headingLevel };
   }
-  const hasCheckbox = /^-\s*\[[^\]]*\]/.test(trimmed);
+  const hasCheckbox = /^(?:-|\d+\.)\s*\[[^\]]*\]/.test(trimmed);
   const leadingWhitespace = ((_a = line.match(/^(\s*)/)) == null ? void 0 : _a[1]) || "";
   const tabCount = (leadingWhitespace.match(/\t/g) || []).length;
   const spaceCount = (leadingWhitespace.match(/ /g) || []).length;
   const indent = tabCount + Math.floor(spaceCount / 2);
-  const normalized = trimmed.replace(/^-\s*\[[^\]]*\]\s*/, "").replace(/^-\s*/, "").replace(/^(✅ Pass|❌ Fail|⏭️ Skipped|🚫 Blocked)\s*\|\s*/, "").replace(/^\*\*(.*?)\*\*(.*)$/, "$1$2");
+  const normalized = trimmed.replace(/^(?:-|\d+\.)\s*\[[^\]]*\]\s*/, "").replace(/^(?:-|\d+\.)\s*/, "").replace(/^(✅ Pass|❌ Fail|⏭️ Skipped|🚫 Blocked)\s*\|\s*/, "").replace(/^\*\*(.*?)\*\*(.*)$/, "$1$2");
   const tagRegex = /@([\p{L}\p{N}_-]+)/gu;
   const tags = [];
   let match;
