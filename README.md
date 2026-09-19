@@ -78,9 +78,11 @@ See [full documentation](https://github.com/Yvyn/obsidian-tms/blob/main/GUIDE.md
 
 ### Manual
 
-1. Download `main.js`, `manifest.json`, `styles.css` from the [latest release](../../releases/latest)
-2. Copy them to `.obsidian/plugins/tms/` in your vault
+1. Clone or download this repository (`main.js`, `manifest.json`, and `styles.css` are committed and always up to date on `main` — no build step needed)
+2. Copy those three files to `.obsidian/plugins/tms/` in your vault
 3. Enable the plugin in **Settings → Community Plugins**
+
+There's no versioned release — re-download the repo to get the latest fixes.
 
 ## License
 
